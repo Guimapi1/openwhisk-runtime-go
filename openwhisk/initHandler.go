@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type initBodyRequest struct {
@@ -51,6 +52,13 @@ func sendOK(w http.ResponseWriter) {
 }
 
 func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
+
+	start := time.Now().UnixNano()
+    defer func() {
+        if ap.metrics != nil {
+            ap.metrics.Add("/init", start, time.Now().UnixNano())
+        }
+    }()
 
 	// you can do multiple initializations when debugging
 	if ap.initialized && !Debugging {

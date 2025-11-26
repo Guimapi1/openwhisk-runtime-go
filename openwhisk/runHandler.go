@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"time"
 )
 
 // ErrResponse is the response when there are errors
@@ -44,6 +45,13 @@ func sendError(w http.ResponseWriter, code int, cause string) {
 }
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
+
+	start := time.Now().UnixNano()
+    defer func() {
+        if ap.metrics != nil {
+            ap.metrics.Add("/run", start, time.Now().UnixNano())
+        }
+    }()
 
 	// parse the request
 	body, err := ioutil.ReadAll(r.Body)

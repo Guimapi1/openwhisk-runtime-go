@@ -53,6 +53,9 @@ type ActionProxy struct {
 
 	// environment
 	env map[string]string
+
+	// metrics
+	metrics *Metrics
 }
 
 // NewActionProxy creates a new action proxy that can handle http requests
@@ -67,6 +70,7 @@ func NewActionProxy(baseDir string, compiler string, outFile *os.File, errFile *
 		outFile,
 		errFile,
 		map[string]string{},
+		NewMetrics(1000),
 	}
 }
 
@@ -170,7 +174,10 @@ func (ap *ActionProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ap.initHandler(w, r)
 	case "/run":
 		ap.runHandler(w, r)
+	case "/metric":
+		ap.metricHandler(w, r)
 	}
+
 }
 
 // Start creates a proxy to execute actions
