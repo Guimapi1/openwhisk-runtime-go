@@ -8,9 +8,15 @@ import (
 	"time"
 )
 
-const raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/intel-rapl:1:0/energy_uj"
+
 
 func readEnergy() (int64, error) {
+	raplPath := os.Getenv("RAPL_PATH")
+
+	if raplPath == "" {
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/intel-rapl:1:0/energy_uj"
+	}
+
 	dat, err := os.ReadFile(raplPath)
 
 	if err != nil {
