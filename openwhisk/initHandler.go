@@ -54,11 +54,11 @@ func sendOK(w http.ResponseWriter) {
 func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now().UnixNano()
-    defer func() {
-        if ap.metrics != nil {
-            ap.metrics.Add("/init", start, time.Now().UnixNano())
-        }
-    }()
+	energyStart, err := readEnergy()
+
+	if err != nil {
+		log.Printf("readEnergy start:%v", err)
+	}
 
 	// you can do multiple initializations when debugging
 	if ap.initialized && !Debugging {
@@ -151,6 +151,8 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	ap.initialized = true
 	sendOK(w)
+
+	ap.recordMetrics("/init", start, energyStart)
 }
 
 // ExtractAndCompile decode the buffer and if a compiler is defined, compile it also

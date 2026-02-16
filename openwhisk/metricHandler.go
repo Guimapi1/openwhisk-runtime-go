@@ -10,6 +10,9 @@ import (
 type Entry struct {
 	Start int64 `json:"start"`
 	End   int64 `json:"end"`
+	EnergyStart int64 `json:"energy_start"`
+	EnergyEnd int64 `json:"energy_end"`
+	// InstructionCPU int64 `json:"instruction_cpu"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.
@@ -28,14 +31,19 @@ func NewMetrics(limit int) *Metrics {
 }
 
 // Add ajoute une paire start/end pour l'endpoint donné.
-func (m *Metrics) Add(endpoint string, startNs, endNs int64) {
+func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd int64) {
 	if startNs == 0 && endNs == 0 {
 		return
 	}
+
+	if energyStart == 0 && energyEnd == 0 {
+		return
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.data[endpoint]
-	s = append(s, Entry{Start: startNs, End: endNs})
+	s = append(s, Entry{Start: startNs, End: endNs, EnergyStart: energyStart, EnergyEnd: energyEnd})
 	if m.limit > 0 && len(s) > m.limit {
 		s = s[len(s)-m.limit:]
 	}

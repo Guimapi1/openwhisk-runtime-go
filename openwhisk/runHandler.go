@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"time"
 )
@@ -47,11 +48,11 @@ func sendError(w http.ResponseWriter, code int, cause string) {
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now().UnixNano()
-    defer func() {
-        if ap.metrics != nil {
-            ap.metrics.Add("/run", start, time.Now().UnixNano())
-        }
-    }()
+	energyStart, err := readEnergy()
+
+	if err != nil {
+		log.Printf("readEnergy start:%v", err)
+	}
 
 	// parse the request
 	body, err := ioutil.ReadAll(r.Body)
@@ -118,4 +119,6 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusInternalServerError, fmt.Sprintf("Only wrote %d of %d bytes to response", numBytesWritten, len(response)))
 		return
 	}
+
+	ap.recordMetrics("/run", start, energyStart)
 }
