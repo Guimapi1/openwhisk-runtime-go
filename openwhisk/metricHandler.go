@@ -35,11 +35,7 @@ func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd in
 	if startNs == 0 && endNs == 0 {
 		return
 	}
-
-	if energyStart == 0 && energyEnd == 0 {
-		return
-	}
-
+	
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.data[endpoint]
