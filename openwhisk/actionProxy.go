@@ -172,8 +172,8 @@ func (ap *ActionProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/init":
 		ap.initHandler(w, r)
-	// case "/run":
-	// 	ap.runHandler(w, r)
+	case "/run":
+		ap.runHandler(w, r)
 	case "/metric":
 		ap.metricHandler(w, r)
 	}
