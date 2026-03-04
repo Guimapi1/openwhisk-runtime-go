@@ -21,10 +21,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"time"
+	"net/http/httputil"
 )
 
 // ErrResponse is the response when there are errors
@@ -46,6 +47,12 @@ func sendError(w http.ResponseWriter, code int, cause string) {
 }
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
+	dump, err := httputil.DumpRequest(r, true)
+	if err != nil {
+		log.Printf("Dump error: %v", err)
+	} else {
+		log.Printf("FULL REQUEST:\n%s", string(dump))
+	}
 
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
@@ -55,7 +62,7 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// parse the request
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if err != nil {
 		sendError(w, http.StatusBadRequest, fmt.Sprintf("Error reading request body: %v", err))
