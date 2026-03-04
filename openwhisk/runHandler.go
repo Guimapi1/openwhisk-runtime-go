@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"net/http"
 	"time"
 	"net/http/httputil"
@@ -44,6 +45,11 @@ func sendError(w http.ResponseWriter, code int, cause string) {
 	w.WriteHeader(code)
 	w.Write(b)
 	w.Write([]byte("\n"))
+}
+
+type runRequest struct {
+	ActivationID string                 `json:"activation_id"`
+	Value        map[string]interface{} `json:"value"`
 }
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
@@ -79,6 +85,16 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 	if ap.theExecutor.Exited() {
 		sendError(w, http.StatusInternalServerError, fmt.Sprintf("command exited"))
 		return
+	}
+
+	// extraire les métadonnées avant de supprimer les newlines
+	var req runRequest
+	meta := &RunMeta{ContainerID: os.Getenv("HOSTNAME")}
+	if err := json.Unmarshal(body, &req); err == nil {
+		meta.ActivationID = req.ActivationID
+		if v, ok := req.Value["energy_trace_id"]; ok {
+			meta.TraceID, _ = v.(string)
+		}
 	}
 
 	// remove newlines
@@ -127,5 +143,5 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ap.recordMetrics("/run", start, energyStart)
+	ap.recordMetrics("/run", start, energyStart, meta)
 }

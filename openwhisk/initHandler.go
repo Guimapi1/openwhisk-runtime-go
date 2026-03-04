@@ -21,7 +21,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -59,7 +59,6 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("FULL REQUEST:\n%s", string(dump))
 	}
-
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
 
@@ -80,7 +79,7 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 		Debug("compiler: " + ap.compiler)
 	}
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	defer r.Body.Close()
 	if err != nil {
 		sendError(w, http.StatusBadRequest, fmt.Sprintf("%v", err))
@@ -159,7 +158,17 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 	ap.initialized = true
 	sendOK(w)
 
-	ap.recordMetrics("/init", start, energyStart)
+	// récupération de l'activation_id depuis l'env du payload
+	activationID := ""
+	if v, ok := request.Value.Env["__OW_ACTIVATION_ID"]; ok {
+		activationID, _ = v.(string)
+	}
+
+	ap.recordMetrics("/init", start, energyStart, &RunMeta{
+		TraceID:      "", // pas disponible à l'init
+		ContainerID:  os.Getenv("HOSTNAME"),
+		ActivationID: activationID,
+	})
 }
 
 // ExtractAndCompile decode the buffer and if a compiler is defined, compile it also

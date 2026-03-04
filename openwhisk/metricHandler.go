@@ -6,14 +6,21 @@ import (
 	"sync"
 )
 
+type RunMeta struct {
+	TraceID      string
+	ContainerID  string
+	ActivationID string
+}
+
 // Entry représente une paire start/end en nanosecondes.
 type Entry struct {
 	Start int64 `json:"start"`
 	End   int64 `json:"end"`
 	EnergyStart int64 `json:"energy_start"`
 	EnergyEnd int64 `json:"energy_end"`
-	// TraceID string `json:"energy_trace_id"`
-	// ContainerID string `json:"container_id"`
+	TraceID string `json:"energy_trace_id"`
+	ContainerID string `json:"container_id"`
+	ActivationID string `json:"activation_id"`
 	// InstructionCPU int64 `json:"instruction_cpu"`
 }
 
@@ -33,15 +40,28 @@ func NewMetrics(limit int) *Metrics {
 }
 
 // Add ajoute une paire start/end pour l'endpoint donné.
-func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd int64) {
+func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd int64, meta *RunMeta) {
 	if startNs == 0 && endNs == 0 {
 		return
 	}
-	
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	entry := Entry{
+		Start:       startNs,
+		End:         endNs,
+		EnergyStart: energyStart,
+		EnergyEnd:   energyEnd,
+	}
+	if meta != nil {
+		entry.TraceID      = meta.TraceID
+		entry.ContainerID  = meta.ContainerID
+		entry.ActivationID = meta.ActivationID
+	}
+
 	s := m.data[endpoint]
-	s = append(s, Entry{Start: startNs, End: endNs, EnergyStart: energyStart, EnergyEnd: energyEnd})
+	s = append(s, entry)
 	if m.limit > 0 && len(s) > m.limit {
 		s = s[len(s)-m.limit:]
 	}

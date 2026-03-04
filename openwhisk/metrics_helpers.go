@@ -26,12 +26,12 @@ func readEnergy() (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(string(dat)), 10, 64)
 }
 
-func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64) {
-    energyEnd, err := readEnergy()
-    if err != nil {
-        log.Printf("readEnergy end %s: %v", endpoint, err)
-    }
-    if ap.metrics != nil {
-        ap.metrics.Add(endpoint, start, time.Now().UnixNano(), energyStart, energyEnd)
-    }
+func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, meta *RunMeta) {
+	energyEnd, err := readEnergy()
+	if err != nil {
+		log.Printf("readEnergy end %s: %v", endpoint, err)
+	}
+	if ap.metrics != nil {
+		ap.metrics.Add(endpoint, start, time.Now().UnixNano(), energyStart, energyEnd, meta)
+	}
 }
