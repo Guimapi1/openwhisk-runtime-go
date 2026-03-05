@@ -27,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-	"net/http/httputil"
 )
 
 type initBodyRequest struct {
@@ -53,12 +52,12 @@ func sendOK(w http.ResponseWriter) {
 }
 
 func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
-	dump, err := httputil.DumpRequest(r, true)
-	if err != nil {
-		log.Printf("Dump error: %v", err)
-	} else {
-		log.Printf("FULL REQUEST:\n%s", string(dump))
-	}
+	// dump, err := httputil.DumpRequest(r, true)
+	// if err != nil {
+	// 	log.Printf("Dump error: %v", err)
+	// } else {
+	// 	log.Printf("FULL REQUEST:\n%s", string(dump))
+	// }
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
 
@@ -166,7 +165,7 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 
 	ap.recordMetrics("/init", start, energyStart, &RunMeta{
 		TraceID:      "", // pas disponible à l'init
-		ContainerID:  os.Getenv("HOSTNAME"),
+		PodName:  os.Getenv("HOSTNAME"),
 		ActivationID: activationID,
 	})
 }

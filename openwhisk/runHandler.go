@@ -26,7 +26,6 @@ import (
 	"os"
 	"net/http"
 	"time"
-	"net/http/httputil"
 )
 
 // ErrResponse is the response when there are errors
@@ -53,12 +52,6 @@ type runRequest struct {
 }
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
-	dump, err := httputil.DumpRequest(r, true)
-	if err != nil {
-		log.Printf("Dump error: %v", err)
-	} else {
-		log.Printf("FULL REQUEST:\n%s", string(dump))
-	}
 
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
@@ -89,7 +82,7 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 
 	// extraire les métadonnées avant de supprimer les newlines
 	var req runRequest
-	meta := &RunMeta{ContainerID: os.Getenv("HOSTNAME")}
+	meta := &RunMeta{PodName: os.Getenv("HOSTNAME")}
 	if err := json.Unmarshal(body, &req); err == nil {
 		meta.ActivationID = req.ActivationID
 		if v, ok := req.Value["energy_trace_id"]; ok {

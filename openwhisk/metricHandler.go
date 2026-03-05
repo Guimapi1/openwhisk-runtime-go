@@ -8,7 +8,7 @@ import (
 
 type RunMeta struct {
 	TraceID      string
-	ContainerID  string
+	PodName  string
 	ActivationID string
 }
 
@@ -19,7 +19,7 @@ type Entry struct {
 	EnergyStart int64 `json:"energy_start"`
 	EnergyEnd int64 `json:"energy_end"`
 	TraceID string `json:"energy_trace_id"`
-	ContainerID string `json:"container_id"`
+	PodName string `json:"pod_name"`
 	ActivationID string `json:"activation_id"`
 	// InstructionCPU int64 `json:"instruction_cpu"`
 }
@@ -56,7 +56,7 @@ func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd in
 	}
 	if meta != nil {
 		entry.TraceID      = meta.TraceID
-		entry.ContainerID  = meta.ContainerID
+		entry.PodName  = meta.PodName
 		entry.ActivationID = meta.ActivationID
 	}
 

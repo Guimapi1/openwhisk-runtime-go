@@ -31,7 +31,25 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 	if err != nil {
 		log.Printf("readEnergy end %s: %v", endpoint, err)
 	}
+
+	end := time.Now().UnixNano()
+
 	if ap.metrics != nil {
-		ap.metrics.Add(endpoint, start, time.Now().UnixNano(), energyStart, energyEnd, meta)
+		ap.metrics.Add(endpoint, start, end, energyStart, energyEnd, meta)
 	}
+
+	entry := Entry{
+		Start:       start,
+		End:         end,
+		EnergyStart: energyStart,
+		EnergyEnd:   energyEnd,
+	}
+	if meta != nil {
+		entry.TraceID      = meta.TraceID
+		entry.PodName  = meta.PodName
+		entry.ActivationID = meta.ActivationID
+	}
+
+	// push asynchrone pour ne pas bloquer la réponse HTTP
+	go pushMetrics(endpoint, entry)
 }
