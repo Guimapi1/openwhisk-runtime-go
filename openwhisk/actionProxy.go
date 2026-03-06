@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // ActionProxy is the container of the data specific to a server
@@ -56,6 +57,10 @@ type ActionProxy struct {
 
 	// metrics
 	metrics *Metrics
+
+	pendingInitEntry *Entry
+	pendingInitMu    sync.Mutex
+	
 }
 
 // NewActionProxy creates a new action proxy that can handle http requests
@@ -71,6 +76,8 @@ func NewActionProxy(baseDir string, compiler string, outFile *os.File, errFile *
 		errFile,
 		map[string]string{},
 		NewMetrics(1000),
+		nil,
+		sync.Mutex{},
 	}
 }
 

@@ -158,16 +158,13 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 	sendOK(w)
 
 	// récupération de l'activation_id depuis l'env du payload
-	activationID := ""
-	if v, ok := request.Value.Env["__OW_ACTIVATION_ID"]; ok {
-		activationID, _ = v.(string)
-	}
+	// activationID := ""
+	// if v, ok := request.Value.Env["__OW_ACTIVATION_ID"]; ok {
+	// 	activationID, _ = v.(string)
+	// }
 
-	ap.recordMetrics("/init", start, energyStart, &RunMeta{
-		TraceID:      "", // pas disponible à l'init
-		PodName:  os.Getenv("HOSTNAME"),
-		ActivationID: activationID,
-	})
+	meta := &RunMeta{PodName: os.Getenv("HOSTNAME")}
+	ap.recordMetrics("/init", start, energyStart, meta)
 }
 
 // ExtractAndCompile decode the buffer and if a compiler is defined, compile it also

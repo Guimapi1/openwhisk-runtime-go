@@ -34,10 +34,7 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 
 	end := time.Now().UnixNano()
 
-	if ap.metrics != nil {
-		ap.metrics.Add(endpoint, start, end, energyStart, energyEnd, meta)
-	}
-
+	
 	entry := Entry{
 		Start:       start,
 		End:         end,
@@ -50,6 +47,29 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 		entry.ActivationID = meta.ActivationID
 	}
 
-	// push asynchrone pour ne pas bloquer la réponse HTTP
-	go pushMetrics(endpoint, entry)
+	if ap.metrics != nil {
+		ap.metrics.Add(endpoint, start, end, energyStart, energyEnd, meta)
+	}
+
+	if endpoint == "/run" {
+        // Flusher le init en attente avec le trace_id maintenant connu
+        ap.pendingInitMu.Lock()
+        if ap.pendingInitEntry != nil {
+            ap.pendingInitEntry.TraceID      = entry.TraceID
+            ap.pendingInitEntry.ActivationID = entry.ActivationID
+            pending := *ap.pendingInitEntry
+            ap.pendingInitEntry = nil
+            ap.pendingInitMu.Unlock()
+            go pushMetrics("/init", pending)
+        } else {
+            ap.pendingInitMu.Unlock()
+        }
+        go pushMetrics("/run", entry)
+    } else {
+        // endpoint == "/init" : bufferiser sans pusher
+        ap.pendingInitMu.Lock()
+        ap.pendingInitEntry = &entry
+        ap.pendingInitMu.Unlock()
+    }
+
 }
