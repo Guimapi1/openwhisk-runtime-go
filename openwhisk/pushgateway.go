@@ -1,6 +1,8 @@
 package openwhisk
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,85 +11,67 @@ import (
 	"time"
 )
 
-// pushMetrics envoie les métriques d'une entrée vers le Pushgateway via l'API text/plain.
-// Format Pushgateway :
-//   POST /metrics/job/<job>/instance/<instance>/activation_id/<id>/trace_id/<trace>/container_id/<container>
+// collectorPayload correspond exactement à MetricPayload dans le collecteur.
+type collectorPayload struct {
+	Endpoint         string `json:"endpoint"`
+	Start            int64  `json:"start"`
+	End              int64  `json:"end"`
+	EnergyStart      int64  `json:"energy_start"`
+	EnergyEnd        int64  `json:"energy_end"`
+	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	TraceID          string `json:"energy_trace_id"`
+	PodName          string `json:"pod_name"`
+	ActivationID     string `json:"activation_id"`
+}
 
+// pushMetrics envoie les métriques d'une entrée vers le collecteur central.
+// L'URL du collecteur est lue depuis COLLECTOR_URL (ex: http://ow-collector:9090).
 func pushMetrics(endpoint string, entry Entry) {
-	pushgatewayURL := os.Getenv("PUSHGATEWAY_URL")
-	if pushgatewayURL == "" {
-		log.Printf("PUSHGATEWAY_URL not set, skipping push")
+	collectorURL := os.Getenv("COLLECTOR_URL")
+	if collectorURL == "" {
+		log.Printf("COLLECTOR_URL not set, skipping push")
 		return
 	}
 
-	// normaliser l'endpoint pour en faire un nom de métrique valide : /init -> init, /run -> run
-	endpointName := strings.TrimPrefix(endpoint, "/")
-
-	// construire les labels de grouping dans l'URL
-	PodName := entry.PodName
-	if PodName == "" {
-		PodName = "unknown"
-	}
-	activationID := entry.ActivationID
-	if activationID == "" {
-		activationID = "unknown"
-	}
-	traceID := entry.TraceID
-	if traceID == "" {
-		traceID = "none"
+	payload := collectorPayload{
+		Endpoint:         endpoint,
+		Start:            entry.Start,
+		End:              entry.End,
+		EnergyStart:      entry.EnergyStart,
+		EnergyEnd:        entry.EnergyEnd,
+		EnergyAttributed: entry.EnergyAttributed,
+		TraceID:          entry.TraceID,
+		PodName:          entry.PodName,
+		ActivationID:     entry.ActivationID,
 	}
 
-	url := fmt.Sprintf(
-		"%s/metrics/job/openwhisk_runtime/instance/%s/activation_id/%s/trace_id/%s/endpoint/%s",
-		strings.TrimRight(pushgatewayURL, "/"),
-		PodName,
-		activationID,
-		traceID,
-		endpointName,
-	)
-
-	// corps au format text/plain exposition (Prometheus text format)
-	body := fmt.Sprintf(`# HELP ow_start_ns Timestamp de début en nanosecondes
-# TYPE ow_start_ns gauge
-ow_start_ns %d
-
-# HELP ow_end_ns Timestamp de fin en nanosecondes
-# TYPE ow_end_ns gauge
-ow_end_ns %d
-
-# HELP ow_energy_start_uj Energie RAPL au début en microjoules
-# TYPE ow_energy_start_uj gauge
-ow_energy_start_uj %d
-
-# HELP ow_energy_end_uj Energie RAPL à la fin en microjoules
-# TYPE ow_energy_end_uj gauge
-ow_energy_end_uj %d
-`,
-		entry.Start,
-		entry.End,
-		entry.EnergyStart,
-		entry.EnergyEnd,
-	)
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	body, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("pushMetrics: failed to build request: %v", err)
+		log.Printf("pushMetrics: marshal error: %v", err)
 		return
 	}
-	req.Header.Set("Content-Type", "text/plain; version=0.0.4")
+
+	url := fmt.Sprintf("%s/collect", strings.TrimRight(collectorURL, "/"))
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("pushMetrics: build request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("pushMetrics: failed to push to %s: %v", url, err)
+		log.Printf("pushMetrics: send error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		log.Printf("pushMetrics: unexpected status from Pushgateway: %s", resp.Status)
+		log.Printf("pushMetrics: unexpected status: %s", resp.Status)
 		return
 	}
 
-	log.Printf("pushMetrics: pushed %s metrics for activation %s (trace: %s)", endpointName, activationID, traceID)
+	log.Printf("pushMetrics: sent %s activation=%s trace=%s energy_attr=%dµJ",
+		endpoint, entry.ActivationID, entry.TraceID, entry.EnergyAttributed)
 }

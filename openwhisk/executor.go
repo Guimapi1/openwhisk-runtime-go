@@ -76,6 +76,14 @@ func NewExecutor(logout *os.File, logerr *os.File, command string, env map[strin
 	}
 }
 
+// Pid returns the PID of the underlying process, or 0 if not started.
+func (proc *Executor) Pid() int {
+	if proc.cmd != nil && proc.cmd.Process != nil {
+		return proc.cmd.Process.Pid
+	}
+	return 0
+}
+
 // Interact interacts with the underlying process
 func (proc *Executor) Interact(in []byte) ([]byte, error) {
 	// input to the subprocess

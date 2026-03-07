@@ -41,7 +41,6 @@ type initRequest struct {
 }
 
 func sendOK(w http.ResponseWriter) {
-	// answer OK
 	w.Header().Set("Content-Type", "application/json")
 	buf := []byte("{\"ok\":true}\n")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(buf)))
@@ -52,20 +51,16 @@ func sendOK(w http.ResponseWriter) {
 }
 
 func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
-	// dump, err := httputil.DumpRequest(r, true)
-	// if err != nil {
-	// 	log.Printf("Dump error: %v", err)
-	// } else {
-	// 	log.Printf("FULL REQUEST:\n%s", string(dump))
-	// }
+	// --- Snapshots de début ---
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
-
 	if err != nil {
-		log.Printf("readEnergy start:%v", err)
+		log.Printf("readEnergy start: %v", err)
 	}
+	// Pour /init le processus action n'est pas encore démarré,
+	// donc cpuStart.ProcessTicks sera 0 — c'est attendu.
+	cpuStart := readCPUSnapshot(0)
 
-	// you can do multiple initializations when debugging
 	if ap.initialized && !Debugging {
 		msg := "Cannot initialize the action more than once."
 		sendError(w, http.StatusForbidden, msg)
@@ -73,7 +68,6 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// read body of the request
 	if ap.compiler != "" {
 		Debug("compiler: " + ap.compiler)
 	}
@@ -85,35 +79,29 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// decode request parameters
 	if len(body) < 1000 {
 		Debug("init: decoding %s\n", string(body))
 	}
 
 	var request initRequest
 	err = json.Unmarshal(body, &request)
-
 	if err != nil {
 		sendError(w, http.StatusBadRequest, fmt.Sprintf("Error unmarshaling request: %v", err))
 		return
 	}
 
-	// request with empty code - stop any executor but return ok
 	if request.Value.Code == "" {
 		sendError(w, http.StatusForbidden, "Missing main/no code to execute.")
 		return
 	}
 
-	// passing the env to the action proxy
 	ap.SetEnv(request.Value.Env)
 
-	// setting main
 	main := request.Value.Main
 	if main == "" {
 		main = "main"
 	}
 
-	// extract code eventually decoding it
 	var buf []byte
 	if request.Value.Binary {
 		Debug("it is binary code")
@@ -127,7 +115,6 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 		buf = []byte(request.Value.Code)
 	}
 
-	// if a compiler is defined try to compile
 	_, err = ap.ExtractAndCompile(&buf, main)
 	if err != nil {
 		if os.Getenv("OW_LOG_INIT_ERROR") == "" {
@@ -141,7 +128,6 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// start an action
 	err = ap.StartLatestAction()
 	if err != nil {
 		if os.Getenv("OW_LOG_INIT_ERROR") == "" {
@@ -157,20 +143,13 @@ func (ap *ActionProxy) initHandler(w http.ResponseWriter, r *http.Request) {
 	ap.initialized = true
 	sendOK(w)
 
-	// récupération de l'activation_id depuis l'env du payload
-	// activationID := ""
-	// if v, ok := request.Value.Env["__OW_ACTIVATION_ID"]; ok {
-	// 	activationID, _ = v.(string)
-	// }
-
 	meta := &RunMeta{PodName: os.Getenv("HOSTNAME")}
-	ap.recordMetrics("/init", start, energyStart, meta)
+	ap.recordMetrics("/init", start, energyStart, cpuStart, meta)
 }
 
 // ExtractAndCompile decode the buffer and if a compiler is defined, compile it also
 func (ap *ActionProxy) ExtractAndCompile(buf *[]byte, main string) (string, error) {
 
-	// extract action in src folder
 	file, err := ap.ExtractAction(buf, "src")
 	if err != nil {
 		return "", err
@@ -179,20 +158,17 @@ func (ap *ActionProxy) ExtractAndCompile(buf *[]byte, main string) (string, erro
 		return "", fmt.Errorf("empty filename")
 	}
 
-	// some path surgery
 	dir := filepath.Dir(file)
 	parent := filepath.Dir(dir)
 	srcDir := filepath.Join(parent, "src")
 	binDir := filepath.Join(parent, "bin")
 	binFile := filepath.Join(binDir, "exec")
 
-	// if the file is already compiled or there is no compiler just move it from src to bin
 	if ap.compiler == "" || isCompiled(file) {
 		os.Rename(srcDir, binDir)
 		return binFile, nil
 	}
 
-	// ok let's try to compile
 	Debug("compiling: %s main: %s", file, main)
 	os.Mkdir(binDir, 0755)
 	err = ap.CompileAction(main, srcDir, binDir)
@@ -200,7 +176,6 @@ func (ap *ActionProxy) ExtractAndCompile(buf *[]byte, main string) (string, erro
 		return "", err
 	}
 
-	// check only if the file exist
 	if _, err := os.Stat(binFile); os.IsNotExist(err) {
 		return "", fmt.Errorf("cannot compile")
 	}

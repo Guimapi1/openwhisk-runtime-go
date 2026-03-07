@@ -8,20 +8,22 @@ import (
 
 type RunMeta struct {
 	TraceID      string
-	PodName  string
+	PodName      string
 	ActivationID string
 }
 
-// Entry représente une paire start/end en nanosecondes.
+// Entry représente une mesure complète pour une invocation.
 type Entry struct {
-	Start int64 `json:"start"`
-	End   int64 `json:"end"`
-	EnergyStart int64 `json:"energy_start"`
-	EnergyEnd int64 `json:"energy_end"`
-	TraceID string `json:"energy_trace_id"`
-	PodName string `json:"pod_name"`
-	ActivationID string `json:"activation_id"`
-	// InstructionCPU int64 `json:"instruction_cpu"`
+	Start            int64  `json:"start"`
+	End              int64  `json:"end"`
+	EnergyStart      int64  `json:"energy_start"`
+	EnergyEnd        int64  `json:"energy_end"`
+	// EnergyAttributed est la fraction d'énergie RAPL attribuée à cette action
+	// via pondération CPU : delta_RAPL × (cpu_process / cpu_total).
+	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	TraceID          string `json:"energy_trace_id"`
+	PodName          string `json:"pod_name"`
+	ActivationID     string `json:"activation_id"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.
@@ -29,7 +31,7 @@ type Entry struct {
 type Metrics struct {
 	mu    sync.RWMutex
 	data  map[string][]Entry
-	limit int // nombre maximal d'entrées par endpoint
+	limit int
 }
 
 func NewMetrics(limit int) *Metrics {
@@ -39,26 +41,13 @@ func NewMetrics(limit int) *Metrics {
 	}
 }
 
-// Add ajoute une paire start/end pour l'endpoint donné.
-func (m *Metrics) Add(endpoint string, startNs, endNs, energyStart, energyEnd int64, meta *RunMeta) {
-	if startNs == 0 && endNs == 0 {
+// Add ajoute une Entry pour l'endpoint donné.
+func (m *Metrics) Add(endpoint string, entry Entry) {
+	if entry.Start == 0 && entry.End == 0 {
 		return
 	}
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	entry := Entry{
-		Start:       startNs,
-		End:         endNs,
-		EnergyStart: energyStart,
-		EnergyEnd:   energyEnd,
-	}
-	if meta != nil {
-		entry.TraceID      = meta.TraceID
-		entry.PodName  = meta.PodName
-		entry.ActivationID = meta.ActivationID
-	}
 
 	s := m.data[endpoint]
 	s = append(s, entry)
@@ -82,7 +71,6 @@ func (m *Metrics) Snapshot() map[string][]Entry {
 }
 
 // metricHandler renvoie le snapshot JSON via HTTP.
-// Doit être utilisé comme méthode d'ActionProxy : ap.metricHandler(w,r)
 func (ap *ActionProxy) metricHandler(w http.ResponseWriter, r *http.Request) {
 	if ap.metrics == nil {
 		http.Error(w, "metrics not initialized", http.StatusServiceUnavailable)

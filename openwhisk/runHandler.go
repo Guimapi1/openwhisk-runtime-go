@@ -23,8 +23,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -53,11 +53,16 @@ type runRequest struct {
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 
+	// --- Snapshots de début : timestamp, énergie et CPU pris simultanément ---
 	start := time.Now().UnixNano()
 	energyStart, err := readEnergy()
-
 	if err != nil {
-		log.Printf("readEnergy start:%v", err)
+		log.Printf("readEnergy start: %v", err)
+	}
+	// Le PID est stable pendant toute la durée de l'invocation
+	var cpuStart CPUSnapshot
+	if ap.theExecutor != nil {
+		cpuStart = readCPUSnapshot(ap.theExecutor.Pid())
 	}
 
 	// parse the request
@@ -136,5 +141,6 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ap.recordMetrics("/run", start, energyStart, meta)
+	// --- Enregistrement des métriques avec pondération CPU ---
+	ap.recordMetrics("/run", start, energyStart, cpuStart, meta)
 }
