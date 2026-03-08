@@ -20,7 +20,7 @@ type CPUSnapshot struct {
 func readEnergy() (int64, error) {
 	raplPath := os.Getenv("RAPL_PATH")
 	if raplPath == "" {
-		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/energy_uj"
 	}
 	dat, err := os.ReadFile(raplPath)
 	if err != nil {
