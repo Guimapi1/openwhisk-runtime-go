@@ -79,6 +79,12 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusInternalServerError, fmt.Sprintf("no action defined yet"))
 		return
 	}
+
+	if ap.theExecutor != nil {
+		log.Printf("DEBUG executor pid=%d", ap.theExecutor.Pid())
+		cpuStart = readCPUSnapshot(ap.theExecutor.Pid())
+	}
+	
 	// check if the process exited
 	if ap.theExecutor.Exited() {
 		sendError(w, http.StatusInternalServerError, fmt.Sprintf("command exited"))
