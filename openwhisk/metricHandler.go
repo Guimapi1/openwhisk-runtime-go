@@ -14,16 +14,20 @@ type RunMeta struct {
 
 // Entry représente une mesure complète pour une invocation.
 type Entry struct {
-	Start            int64  `json:"start"`
-	End              int64  `json:"end"`
-	EnergyStart      int64  `json:"energy_start"`
-	EnergyEnd        int64  `json:"energy_end"`
-	// EnergyAttributed est la fraction d'énergie RAPL attribuée à cette action
-	// via pondération CPU : delta_RAPL × (cpu_process / cpu_total).
-	EnergyAttributed int64  `json:"energy_attributed_uj"`
-	TraceID          string `json:"energy_trace_id"`
-	PodName          string `json:"pod_name"`
-	ActivationID     string `json:"activation_id"`
+	Start            int64             `json:"start"`
+	End              int64             `json:"end"`
+	EnergyStart      int64             `json:"energy_start"`
+	EnergyEnd        int64             `json:"energy_end"`
+	// EnergyAttributed est l'énergie attribuée à cette action en µJ.
+	EnergyAttributed int64             `json:"energy_attributed_uj"`
+	// EnergyMethod indique comment EnergyAttributed a été calculé :
+	//   0 = weighted (pondération CPU, précis)
+	//   1 = rapl_direct (action trop courte, borne supérieure)
+	//   2 = unavailable (RAPL non disponible)
+	EnergyMethod     EnergyAttribution `json:"energy_method"`
+	TraceID          string            `json:"energy_trace_id"`
+	PodName          string            `json:"pod_name"`
+	ActivationID     string            `json:"activation_id"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.

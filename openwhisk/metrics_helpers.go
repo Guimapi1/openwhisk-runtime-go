@@ -20,7 +20,7 @@ type CPUSnapshot struct {
 func readEnergy() (int64, error) {
 	raplPath := os.Getenv("RAPL_PATH")
 	if raplPath == "" {
-		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/energy_uj"
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
 	}
 	dat, err := os.ReadFile(raplPath)
 	if err != nil {
@@ -110,20 +110,45 @@ func readCPUSnapshot(pid int) CPUSnapshot {
 	return snap
 }
 
+// EnergyAttribution décrit comment l'énergie a été calculée.
+type EnergyAttribution uint8
+
+const (
+	// AttrWeighted : pondération CPU disponible, calcul précis.
+	AttrWeighted EnergyAttribution = iota
+	// AttrRAPLDirect : action trop courte pour mesurer les ticks CPU (< 10ms),
+	// on utilise le delta RAPL brut — valeur conservatrice (sur-estimation possible).
+	AttrRAPLDirect
+	// AttrUnavailable : RAPL non disponible, énergie inconnue.
+	AttrUnavailable
+)
+
 // attributedEnergyUJ calcule la fraction d'énergie RAPL attribuée au processus.
-// Si les deltas CPU sont nuls ou incohérents on renvoie 0 (pas d'estimation).
-func attributedEnergyUJ(deltaRAPL int64, snapStart, snapEnd CPUSnapshot) int64 {
+//
+// Stratégie à trois niveaux :
+//  1. Si delta_process_ticks > 0 → pondération CPU précise.
+//  2. Si delta_process_ticks == 0 (action < ~10ms) → delta RAPL brut comme
+//     borne supérieure conservative. On note la méthode dans attr.
+//  3. Si RAPL indisponible (deltaRAPL <= 0) → 0, AttrUnavailable.
+func attributedEnergyUJ(deltaRAPL int64, snapStart, snapEnd CPUSnapshot) (int64, EnergyAttribution) {
+	if deltaRAPL <= 0 {
+		return 0, AttrUnavailable
+	}
+
 	deltaProcess := snapEnd.ProcessTicks - snapStart.ProcessTicks
 	deltaTotal := snapEnd.TotalTicks - snapStart.TotalTicks
 
-	if deltaTotal <= 0 || deltaProcess < 0 {
-		return 0
+	// Pondération CPU possible
+	if deltaTotal > 0 && deltaProcess > 0 {
+		if deltaProcess > deltaTotal {
+			deltaProcess = deltaTotal
+		}
+		return deltaRAPL * deltaProcess / deltaTotal, AttrWeighted
 	}
-	if deltaProcess > deltaTotal {
-		// Cas théoriquement impossible mais défensif
-		deltaProcess = deltaTotal
-	}
-	return deltaRAPL * deltaProcess / deltaTotal
+
+	// Action trop courte : les ticks USER_HZ (10ms/tick) ne bougent pas.
+	// On retourne le delta RAPL brut comme borne supérieure.
+	return deltaRAPL, AttrRAPLDirect
 }
 
 // recordMetrics calcule et enregistre les métriques énergétiques d'un endpoint.
@@ -143,7 +168,7 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 	}
 
 	deltaRAPL := energyEnd - energyStart
-	attributed := attributedEnergyUJ(deltaRAPL, cpuStart, cpuEnd)
+	attributed, attrMethod := attributedEnergyUJ(deltaRAPL, cpuStart, cpuEnd)
 
 	entry := Entry{
 		Start:            start,
@@ -151,6 +176,7 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 		EnergyStart:      energyStart,
 		EnergyEnd:        energyEnd,
 		EnergyAttributed: attributed,
+		EnergyMethod:     attrMethod,
 	}
 	if meta != nil {
 		entry.TraceID      = meta.TraceID

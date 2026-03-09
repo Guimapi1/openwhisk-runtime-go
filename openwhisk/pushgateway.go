@@ -19,6 +19,7 @@ type collectorPayload struct {
 	EnergyStart      int64  `json:"energy_start"`
 	EnergyEnd        int64  `json:"energy_end"`
 	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	EnergyMethod     uint8  `json:"energy_method"`
 	TraceID          string `json:"energy_trace_id"`
 	PodName          string `json:"pod_name"`
 	ActivationID     string `json:"activation_id"`
@@ -40,6 +41,7 @@ func pushMetrics(endpoint string, entry Entry) {
 		EnergyStart:      entry.EnergyStart,
 		EnergyEnd:        entry.EnergyEnd,
 		EnergyAttributed: entry.EnergyAttributed,
+		EnergyMethod:     uint8(entry.EnergyMethod),
 		TraceID:          entry.TraceID,
 		PodName:          entry.PodName,
 		ActivationID:     entry.ActivationID,
