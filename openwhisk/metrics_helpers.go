@@ -12,7 +12,7 @@ import (
 // CPUSnapshot contient les ticks CPU d'un processus et du nœud entier,
 // lus quasi-simultanément pour minimiser le biais temporel.
 type CPUSnapshot struct {
-	ProcessTicks int64 // utime + stime du pid cible (en ticks)
+	ProcessTicks int64 // utime + stime du pid cible (en ticks USER_HZ)
 	TotalTicks   int64 // somme de tous les cores depuis /proc/stat
 }
 
@@ -20,13 +20,53 @@ type CPUSnapshot struct {
 func readEnergy() (int64, error) {
 	raplPath := os.Getenv("RAPL_PATH")
 	if raplPath == "" {
-		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/energy_uj"
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
 	}
 	dat, err := os.ReadFile(raplPath)
 	if err != nil {
 		return 0, err
 	}
 	return strconv.ParseInt(strings.TrimSpace(string(dat)), 10, 64)
+}
+
+// raplMaxDir déduit le répertoire RAPL depuis RAPL_PATH.
+func raplMaxDir() string {
+	raplPath := os.Getenv("RAPL_PATH")
+	if raplPath == "" {
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+	}
+	return raplPath[:strings.LastIndex(raplPath, "/")]
+}
+
+// readRAPLMax lit la valeur maximale du registre RAPL en µJ.
+// En cas d'erreur, retourne 2^32 µJ (~4.29 kJ) qui couvre la grande majorité
+// des implémentations Intel connues.
+func readRAPLMax() int64 {
+	path := raplMaxDir() + "/max_energy_range_uj"
+	dat, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("readRAPLMax: %v — using default 2^32", err)
+		return 1 << 32
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(dat)), 10, 64)
+	if err != nil || v <= 0 {
+		log.Printf("readRAPLMax: invalid value — using default 2^32")
+		return 1 << 32
+	}
+	return v
+}
+
+// deltaRAPLUJ calcule la consommation énergétique entre deux relevés en µJ,
+// en corrigeant l'éventuel overflow du registre RAPL.
+// L'overflow se produit quand le compteur dépasse max_energy_range_uj et
+// repart de zéro — dans ce cas energyEnd < energyStart.
+func deltaRAPLUJ(start, end int64) int64 {
+	if end >= start {
+		return end - start
+	}
+	// Overflow : le registre a dépassé son maximum et recommencé depuis 0.
+	max := readRAPLMax()
+	return (max - start) + end
 }
 
 // readProcessTicks lit utime + stime du processus pid depuis /proc/<pid>/stat.
@@ -39,18 +79,16 @@ func readProcessTicks(pid int) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Le format de /proc/<pid>/stat est :
-	// pid (comm) state ppid ... utime(14) stime(15) ...
-	// On localise la fermeture de la parenthèse du champ comm pour éviter
-	// les espaces éventuels dans le nom du processus.
+	// Format /proc/<pid>/stat : pid (comm) state ppid ...
+	// On cherche la dernière ')' pour gérer les espaces dans le nom du processus.
 	s := string(data)
 	closeParen := strings.LastIndex(s, ")")
 	if closeParen < 0 {
 		return 0, fmt.Errorf("unexpected /proc/%d/stat format", pid)
 	}
-	fields := strings.Fields(s[closeParen+1:])
-	// Après le ')' : state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5)
+	// Après ')' : state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5)
 	// flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10) utime(11) stime(12)
+	fields := strings.Fields(s[closeParen+1:])
 	if len(fields) < 13 {
 		return 0, fmt.Errorf("/proc/%d/stat: not enough fields", pid)
 	}
@@ -66,7 +104,6 @@ func readProcessTicks(pid int) (int64, error) {
 }
 
 // readTotalTicks lit la somme des ticks CPU de tous les cores depuis /proc/stat.
-// On utilise la ligne "cpu " (agrégat global) : user nice system idle iowait irq softirq ...
 func readTotalTicks() (int64, error) {
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
@@ -77,7 +114,6 @@ func readTotalTicks() (int64, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		// fields[0] == "cpu", fields[1..] sont les compteurs
 		var total int64
 		for _, f := range fields[1:] {
 			v, err := strconv.ParseInt(f, 10, 64)
@@ -91,9 +127,7 @@ func readTotalTicks() (int64, error) {
 	return 0, fmt.Errorf("/proc/stat: cpu line not found")
 }
 
-// readCPUSnapshot lit simultanément les ticks du processus pid et du nœud.
-// En cas d'erreur sur le processus (pid inconnu, action pas encore démarrée),
-// on renvoie quand même le snapshot avec ProcessTicks=0 et l'erreur loggée.
+// readCPUSnapshot lit simultanément les ticks du processus et du nœud.
 func readCPUSnapshot(pid int) CPUSnapshot {
 	var snap CPUSnapshot
 	var err error
@@ -110,52 +144,31 @@ func readCPUSnapshot(pid int) CPUSnapshot {
 	return snap
 }
 
-// EnergyAttribution décrit comment l'énergie a été calculée.
-type EnergyAttribution uint8
-
-const (
-	// AttrWeighted : pondération CPU disponible, calcul précis.
-	AttrWeighted EnergyAttribution = iota
-	// AttrRAPLDirect : action trop courte pour mesurer les ticks CPU (< 10ms),
-	// on utilise le delta RAPL brut — valeur conservatrice (sur-estimation possible).
-	AttrRAPLDirect
-	// AttrUnavailable : RAPL non disponible, énergie inconnue.
-	AttrUnavailable
-)
-
-// attributedEnergyUJ calcule la fraction d'énergie RAPL attribuée au processus.
+// attributedEnergyUJ calcule la fraction d'énergie RAPL attribuée au processus
+// via pondération CPU : delta_RAPL × (delta_process_ticks / delta_total_ticks).
 //
-// Stratégie à trois niveaux :
-//  1. Si delta_process_ticks > 0 → pondération CPU précise.
-//  2. Si delta_process_ticks == 0 (action < ~10ms) → delta RAPL brut comme
-//     borne supérieure conservative. On note la méthode dans attr.
-//  3. Si RAPL indisponible (deltaRAPL <= 0) → 0, AttrUnavailable.
-func attributedEnergyUJ(deltaRAPL int64, snapStart, snapEnd CPUSnapshot) (int64, EnergyAttribution) {
-	if deltaRAPL <= 0 {
-		return 0, AttrUnavailable
+// Retourne 0 si les ticks CPU sont insuffisants (action trop courte < ~10ms)
+// ou si RAPL n'est pas disponible. Ce cas sera traité ultérieurement.
+func attributedEnergyUJ(energyStart, energyEnd int64, snapStart, snapEnd CPUSnapshot) int64 {
+	delta := deltaRAPLUJ(energyStart, energyEnd)
+	if delta <= 0 {
+		return 0
 	}
 
 	deltaProcess := snapEnd.ProcessTicks - snapStart.ProcessTicks
 	deltaTotal := snapEnd.TotalTicks - snapStart.TotalTicks
 
-	// Pondération CPU possible
-	if deltaTotal > 0 && deltaProcess > 0 {
-		if deltaProcess > deltaTotal {
-			deltaProcess = deltaTotal
-		}
-		return deltaRAPL * deltaProcess / deltaTotal, AttrWeighted
+	if deltaTotal <= 0 || deltaProcess <= 0 {
+		return 0
 	}
-
-	// Action trop courte : les ticks USER_HZ (10ms/tick) ne bougent pas.
-	// On retourne le delta RAPL brut comme borne supérieure.
-	return deltaRAPL, AttrRAPLDirect
+	if deltaProcess > deltaTotal {
+		deltaProcess = deltaTotal
+	}
+	return delta * deltaProcess / deltaTotal
 }
 
 // recordMetrics calcule et enregistre les métriques énergétiques d'un endpoint.
-// Elle doit être appelée APRÈS que l'action a répondu, avec les snapshots
-// pris juste avant et juste après l'exécution.
 func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta) {
-	// Lire les valeurs de fin le plus tôt possible
 	energyEnd, err := readEnergy()
 	if err != nil {
 		log.Printf("readEnergy end %s: %v", endpoint, err)
@@ -167,8 +180,7 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 		cpuEnd = readCPUSnapshot(ap.theExecutor.Pid())
 	}
 
-	deltaRAPL := energyEnd - energyStart
-	attributed, attrMethod := attributedEnergyUJ(deltaRAPL, cpuStart, cpuEnd)
+	attributed := attributedEnergyUJ(energyStart, energyEnd, cpuStart, cpuEnd)
 
 	entry := Entry{
 		Start:            start,
@@ -176,7 +188,6 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 		EnergyStart:      energyStart,
 		EnergyEnd:        energyEnd,
 		EnergyAttributed: attributed,
-		EnergyMethod:     attrMethod,
 	}
 	if meta != nil {
 		entry.TraceID      = meta.TraceID
@@ -189,7 +200,6 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 	}
 
 	if endpoint == "/run" {
-		// Flusher le init en attente avec le trace_id maintenant connu
 		ap.pendingInitMu.Lock()
 		if ap.pendingInitEntry != nil {
 			ap.pendingInitEntry.TraceID      = entry.TraceID
@@ -203,7 +213,6 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 		}
 		go pushMetrics("/run", entry)
 	} else {
-		// endpoint == "/init" : bufferiser sans pusher
 		ap.pendingInitMu.Lock()
 		ap.pendingInitEntry = &entry
 		ap.pendingInitMu.Unlock()

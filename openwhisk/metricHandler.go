@@ -14,24 +14,20 @@ type RunMeta struct {
 
 // Entry représente une mesure complète pour une invocation.
 type Entry struct {
-	Start            int64             `json:"start"`
-	End              int64             `json:"end"`
-	EnergyStart      int64             `json:"energy_start"`
-	EnergyEnd        int64             `json:"energy_end"`
-	// EnergyAttributed est l'énergie attribuée à cette action en µJ.
-	EnergyAttributed int64             `json:"energy_attributed_uj"`
-	// EnergyMethod indique comment EnergyAttributed a été calculé :
-	//   0 = weighted (pondération CPU, précis)
-	//   1 = rapl_direct (action trop courte, borne supérieure)
-	//   2 = unavailable (RAPL non disponible)
-	EnergyMethod     EnergyAttribution `json:"energy_method"`
-	TraceID          string            `json:"energy_trace_id"`
-	PodName          string            `json:"pod_name"`
-	ActivationID     string            `json:"activation_id"`
+	Start            int64  `json:"start"`
+	End              int64  `json:"end"`
+	EnergyStart      int64  `json:"energy_start"`
+	EnergyEnd        int64  `json:"energy_end"`
+	// EnergyAttributed est la fraction d'énergie RAPL attribuée à cette action
+	// via pondération CPU : delta_RAPL × (cpu_process / cpu_total).
+	// Vaut 0 si l'action est trop courte (< ~10ms) ou si RAPL est indisponible.
+	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	TraceID          string `json:"energy_trace_id"`
+	PodName          string `json:"pod_name"`
+	ActivationID     string `json:"activation_id"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.
-// Le cap (limit) évite la croissance infinie de la mémoire.
 type Metrics struct {
 	mu    sync.RWMutex
 	data  map[string][]Entry
@@ -45,7 +41,6 @@ func NewMetrics(limit int) *Metrics {
 	}
 }
 
-// Add ajoute une Entry pour l'endpoint donné.
 func (m *Metrics) Add(endpoint string, entry Entry) {
 	if entry.Start == 0 && entry.End == 0 {
 		return
@@ -61,7 +56,6 @@ func (m *Metrics) Add(endpoint string, entry Entry) {
 	m.data[endpoint] = s
 }
 
-// Snapshot retourne une copie de la map pour sérialisation JSON.
 func (m *Metrics) Snapshot() map[string][]Entry {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -74,7 +68,6 @@ func (m *Metrics) Snapshot() map[string][]Entry {
 	return out
 }
 
-// metricHandler renvoie le snapshot JSON via HTTP.
 func (ap *ActionProxy) metricHandler(w http.ResponseWriter, r *http.Request) {
 	if ap.metrics == nil {
 		http.Error(w, "metrics not initialized", http.StatusServiceUnavailable)
