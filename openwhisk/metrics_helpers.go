@@ -103,28 +103,93 @@ func readProcessTicks(pid int) (int64, error) {
 	return utime + stime, nil
 }
 
-// readTotalTicks lit la somme des ticks CPU de tous les cores depuis /proc/stat.
+// parseCoreMask parse une liste de ranges de cores comme "26-51,78-103"
+// et retourne un set de core IDs.
+func parseCoreMask(mask string) map[int]bool {
+	cores := make(map[int]bool)
+	if mask == "" {
+		return cores
+	}
+	for _, part := range strings.Split(mask, ",") {
+		part = strings.TrimSpace(part)
+		bounds := strings.Split(part, "-")
+		if len(bounds) == 1 {
+			id, err := strconv.Atoi(bounds[0])
+			if err == nil {
+				cores[id] = true
+			}
+		} else if len(bounds) == 2 {
+			lo, err1 := strconv.Atoi(bounds[0])
+			hi, err2 := strconv.Atoi(bounds[1])
+			if err1 == nil && err2 == nil {
+				for i := lo; i <= hi; i++ {
+					cores[i] = true
+				}
+			}
+		}
+	}
+	return cores
+}
+
+// readTotalTicks lit la somme des ticks CPU depuis /proc/stat.
+// Si RAPL_CORES est défini (ex: "26-51,78-103"), on ne somme que les cores
+// de ce socket pour que le dénominateur de pondération soit cohérent avec
+// le registre RAPL lu. Sinon on somme tous les cores (ligne "cpu ").
 func readTotalTicks() (int64, error) {
+	coreMask := os.Getenv("RAPL_CORES")
+
 	data, err := os.ReadFile("/proc/stat")
 	if err != nil {
 		return 0, err
 	}
+
+	// Sans filtre de cores : ligne agrégée "cpu "
+	if coreMask == "" {
+		for _, line := range strings.Split(string(data), "\n") {
+			if !strings.HasPrefix(line, "cpu ") {
+				continue
+			}
+			fields := strings.Fields(line)
+			var total int64
+			for _, f := range fields[1:] {
+				v, err := strconv.ParseInt(f, 10, 64)
+				if err == nil {
+					total += v
+				}
+			}
+			return total, nil
+		}
+		return 0, fmt.Errorf("/proc/stat: cpu line not found")
+	}
+
+	// Avec filtre : on somme uniquement les cores du socket cible.
+	allowedCores := parseCoreMask(coreMask)
+	var total int64
+	found := false
 	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, "cpu ") {
+		if !strings.HasPrefix(line, "cpu") || strings.HasPrefix(line, "cpu ") {
 			continue
 		}
 		fields := strings.Fields(line)
-		var total int64
+		if len(fields) < 2 {
+			continue
+		}
+		coreID, err := strconv.Atoi(strings.TrimPrefix(fields[0], "cpu"))
+		if err != nil || !allowedCores[coreID] {
+			continue
+		}
 		for _, f := range fields[1:] {
 			v, err := strconv.ParseInt(f, 10, 64)
-			if err != nil {
-				continue
+			if err == nil {
+				total += v
 			}
-			total += v
 		}
-		return total, nil
+		found = true
 	}
-	return 0, fmt.Errorf("/proc/stat: cpu line not found")
+	if !found {
+		return 0, fmt.Errorf("/proc/stat: no matching cores found for mask %q", coreMask)
+	}
+	return total, nil
 }
 
 // readCPUSnapshot lit simultanément les ticks du processus et du nœud.
