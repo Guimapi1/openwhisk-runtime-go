@@ -9,14 +9,18 @@ import (
 	"time"
 )
 
-// CPUSnapshot contient les ticks CPU d'un processus et du nœud entier,
-// lus quasi-simultanément pour minimiser le biais temporel.
-// IdleTicks est la somme des ticks idle des cores du socket mesuré.
+// CPUSnapshot contient les mesures CPU prises quasi-simultanément.
+//
+// ProcessTicks : microsecondes de CPU consommées par le container (cgroup),
+//   tous processus et threads confondus. Unité : µs.
+// TotalTicks, IdleTicks : ticks USER_HZ des cores du socket mesuré (RAPL_CORES).
+//   Convertis en µs dans attributedEnergyUJ (1 tick = 10000µs à USER_HZ=100).
+// WallNs : timestamp wall-clock pour mesurer la durée réelle de l'action.
 type CPUSnapshot struct {
-	ProcessTicks int64 // utime + stime de tous les threads du pid cible
-	TotalTicks   int64 // somme de tous les ticks des cores du socket (idle inclus)
-	IdleTicks    int64 // somme des ticks idle des cores du socket
-	WallNs       int64 // timestamp wall-clock en nanosecondes (time.Now().UnixNano())
+	ProcessTicks int64 // CPU du container en µs (cgroup usage_usec)
+	TotalTicks   int64 // ticks USER_HZ totaux des cores du socket
+	IdleTicks    int64 // ticks USER_HZ idle+iowait des cores du socket
+	WallNs       int64 // timestamp wall-clock en ns
 }
 
 // readEnergy lit la valeur RAPL courante en microjoules depuis le chemin configuré.
@@ -92,77 +96,86 @@ func readStatTicks(data []byte) (int64, error) {
 	return utime + stime, nil
 }
 
-// readProcessTicks lit utime+stime du processus pid ET de tous ses threads
-// depuis /proc/<pid>/task/*/stat, puis additionne tout.
-// Les processus enfants (subprocess) sont capturés via cutime+cstime dans
-// /proc/<pid>/stat une fois terminés.
+// readProcessTicks lit les ticks CPU du container via le cgroup du processus pid.
+//
+// On lit /proc/<pid>/cgroup pour trouver le cgroup du container, puis
+// cpu.stat dans ce cgroup. Ce fichier cumule les ticks de TOUS les processus
+// et threads qui ont tourné dans le container (y compris espeak, ffmpeg et
+// leurs threads), sans avoir à les tracker individuellement.
+//
+// Deux hiérarchies sont supportées :
+//   - cgroups v2 : /sys/fs/cgroup/<slice>/cpu.stat  (champ usage_usec)
+//   - cgroups v1 : /sys/fs/cgroup/cpuacct/<slice>/cpuacct.usage (en ns)
+//
+// On retourne une valeur en microsecondes pour rester cohérent avec USER_HZ.
+// Le dénominateur (socketTicks) est lui aussi converti en µs dans attributedEnergyUJ.
 func readProcessTicks(pid int) (int64, error) {
 	if pid <= 0 {
 		return 0, fmt.Errorf("invalid pid %d", pid)
 	}
 
-	// Lire les ticks du processus principal + cutime/cstime (enfants terminés)
-	mainData, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	// Lire le cgroup du processus
+	cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
-		return 0, fmt.Errorf("readProcessTicks pid=%d: %v", pid, err)
+		return 0, fmt.Errorf("read cgroup for pid %d: %v", pid, err)
 	}
-	mainTicks, err := readStatTicksWithChildren(mainData)
+
+	// Essayer cgroups v2 d'abord (ligne "0::/...")
+	for _, line := range strings.Split(string(cgroupData), "\n") {
+		if !strings.HasPrefix(line, "0::/") {
+			continue
+		}
+		slice := strings.TrimPrefix(line, "0::/")
+		slice = strings.TrimSpace(slice)
+		cpuStatPath := "/sys/fs/cgroup/" + slice + "/cpu.stat"
+		usec, err := readCgroupV2CPUUsec(cpuStatPath)
+		if err == nil {
+			return usec, nil
+		}
+	}
+
+	// Fallback cgroups v1 (ligne "7::cpuacct:/...")
+	for _, line := range strings.Split(string(cgroupData), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		if fields[1] != "cpuacct" && !strings.Contains(fields[1], "cpuacct") {
+			continue
+		}
+		slice := strings.TrimSpace(fields[2])
+		cpuacctPath := "/sys/fs/cgroup/cpuacct/" + slice + "/cpuacct.usage"
+		dat, err := os.ReadFile(cpuacctPath)
+		if err != nil {
+			continue
+		}
+		ns, err := strconv.ParseInt(strings.TrimSpace(string(dat)), 10, 64)
+		if err != nil {
+			continue
+		}
+		return ns / 1000, nil // ns → µs
+	}
+
+	return 0, fmt.Errorf("no cgroup cpu usage found for pid %d", pid)
+}
+
+// readCgroupV2CPUUsec lit usage_usec depuis un fichier cpu.stat cgroups v2.
+func readCgroupV2CPUUsec(path string) (int64, error) {
+	dat, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-
-	// Ajouter les ticks des threads vivants depuis /proc/<pid>/task/*/stat
-	taskDir := fmt.Sprintf("/proc/%d/task", pid)
-	entries, err := os.ReadDir(taskDir)
-	if err != nil {
-		return mainTicks, nil
-	}
-
-	var threadTicks int64
-	for _, entry := range entries {
-		// Ignorer le thread principal déjà compté
-		if entry.Name() == fmt.Sprintf("%d", pid) {
+	for _, line := range strings.Split(string(dat), "\n") {
+		if !strings.HasPrefix(line, "usage_usec ") {
 			continue
 		}
-		statPath := fmt.Sprintf("%s/%s/stat", taskDir, entry.Name())
-		data, err := os.ReadFile(statPath)
-		if err != nil {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
 			continue
 		}
-		ticks, err := readStatTicks(data)
-		if err != nil {
-			continue
-		}
-		threadTicks += ticks
+		return strconv.ParseInt(fields[1], 10, 64)
 	}
-
-	return mainTicks + threadTicks, nil
-}
-
-// readStatTicksWithChildren extrait utime+stime+cutime+cstime depuis /proc/<pid>/stat.
-// cutime et cstime accumulent les ticks des processus enfants terminés (ex: espeak, ffmpeg).
-func readStatTicksWithChildren(data []byte) (int64, error) {
-	s := string(data)
-	closeParen := strings.LastIndex(s, ")")
-	if closeParen < 0 {
-		return 0, fmt.Errorf("unexpected stat format")
-	}
-	// Après ')' : state(0) ppid(1) pgrp(2) session(3) tty(4) tpgid(5)
-	// flags(6) minflt(7) cminflt(8) majflt(9) cmajflt(10)
-	// utime(11) stime(12) cutime(13) cstime(14)
-	fields := strings.Fields(s[closeParen+1:])
-	if len(fields) < 15 {
-		return 0, fmt.Errorf("not enough fields for children ticks")
-	}
-	var total int64
-	for _, idx := range []int{11, 12, 13, 14} {
-		v, err := strconv.ParseInt(fields[idx], 10, 64)
-		if err != nil {
-			return 0, err
-		}
-		total += v
-	}
-	return total, nil
+	return 0, fmt.Errorf("usage_usec not found in %s", path)
 }
 
 // parseCoreMask parse une liste de ranges de cores comme "26-51,78-103"
@@ -295,47 +308,47 @@ func readCPUSnapshot(pid int) CPUSnapshot {
 //
 // Formule :
 //
-//	attribution = delta_RAPL × (process_ticks / non_idle_ticks_socket)
+//	attribution = delta_RAPL × (process_usec / non_idle_usec_socket)
 //
-// On utilise les ticks non-idle (actifs) du socket comme dénominateur plutôt
-// que les ticks totaux. Cela évite de diluer le ratio du processus par les
-// ticks idle qui correspondent à d'autres charges sur le socket (système K8s,
-// autres pods, monitoring...).
+// ProcessTicks (issu du cgroup) est en microsecondes de CPU consommées par
+// tous les processus du container (Python + espeak + ffmpeg + threads).
+// TotalTicks et IdleTicks sont en ticks USER_HZ — on les convertit en µs
+// en divisant par USER_HZ (100) et en multipliant par 1e6.
 //
-// Les ticks du processus incluent utime+stime+cutime+cstime (enfants terminés)
-// et tous les threads vivants, ce qui capture espeak-ng et ffmpeg.
-//
-// Retourne 0 si les ticks sont insuffisants (action trop courte < ~10ms).
+// Retourne 0 si les données sont insuffisantes.
 func attributedEnergyUJ(energyStart, energyEnd int64, snapStart, snapEnd CPUSnapshot) int64 {
 	deltaRAPL := deltaRAPLUJ(energyStart, energyEnd)
 	if deltaRAPL <= 0 {
 		return 0
 	}
 
-	deltaTotal   := snapEnd.TotalTicks   - snapStart.TotalTicks
-	deltaIdle    := snapEnd.IdleTicks    - snapStart.IdleTicks
-	deltaProcess := snapEnd.ProcessTicks - snapStart.ProcessTicks
+	// ProcessTicks est en µs (depuis cgroup usage_usec ou cpuacct.usage/1000)
+	deltaProcessUsec := snapEnd.ProcessTicks - snapStart.ProcessTicks
 
-	if deltaTotal <= 0 || deltaProcess <= 0 {
+	// Convertir les ticks socket USER_HZ → µs
+	// 1 tick = 10ms = 10000µs (USER_HZ=100)
+	const tickToUsec = int64(10000)
+	deltaTotalUsec := (snapEnd.TotalTicks - snapStart.TotalTicks) * tickToUsec
+	deltaIdleUsec  := (snapEnd.IdleTicks  - snapStart.IdleTicks)  * tickToUsec
+
+	if deltaTotalUsec <= 0 || deltaProcessUsec <= 0 {
 		return 0
 	}
 
-	// Ticks actifs = total - idle (user+system+irq+softirq+steal...)
-	deltaNonIdle := deltaTotal - deltaIdle
-	if deltaNonIdle <= 0 {
-		// Socket entièrement idle pendant la fenêtre — contribution nulle
+	deltaNonIdleUsec := deltaTotalUsec - deltaIdleUsec
+	if deltaNonIdleUsec <= 0 {
 		return 0
 	}
 
-	cpuRatio := float64(deltaProcess) / float64(deltaNonIdle)
+	cpuRatio := float64(deltaProcessUsec) / float64(deltaNonIdleUsec)
 	if cpuRatio > 1.0 {
 		cpuRatio = 1.0
 	}
 
 	attributed := int64(float64(deltaRAPL) * cpuRatio)
 
-	log.Printf("attributedEnergyUJ: deltaRAPL=%dµJ process=%d nonIdle=%d cpuRatio=%.4f => attributed=%dµJ",
-		deltaRAPL, deltaProcess, deltaNonIdle, cpuRatio, attributed)
+	log.Printf("attributedEnergyUJ: deltaRAPL=%dµJ processUsec=%d nonIdleUsec=%d cpuRatio=%.4f => attributed=%dµJ",
+		deltaRAPL, deltaProcessUsec, deltaNonIdleUsec, cpuRatio, attributed)
 
 	return attributed
 }
