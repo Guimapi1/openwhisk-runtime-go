@@ -23,7 +23,7 @@ type CPUSnapshot struct {
 func readEnergy() (int64, error) {
 	raplPath := os.Getenv("RAPL_PATH")
 	if raplPath == "" {
-		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/energy_uj"
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
 	}
 	dat, err := os.ReadFile(raplPath)
 	if err != nil {
@@ -36,7 +36,7 @@ func readEnergy() (int64, error) {
 func raplMaxDir() string {
 	raplPath := os.Getenv("RAPL_PATH")
 	if raplPath == "" {
-		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:1/energy_uj"
+		raplPath = "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
 	}
 	return raplPath[:strings.LastIndex(raplPath, "/")]
 }
@@ -293,66 +293,51 @@ func readCPUSnapshot(pid int) CPUSnapshot {
 
 // attributedEnergyUJ calcule l'énergie attribuée à l'action en µJ.
 //
-// On adopte la même décomposition que Kepler :
+// Formule :
 //
-//	énergie_active  = delta_RAPL × (1 - ratio_idle_socket)
-//	énergie_idle    = delta_RAPL × ratio_idle_socket
+//	attribution = delta_RAPL × (process_ticks / non_idle_ticks_socket)
 //
-//	attribution = énergie_active × (process_ticks / non_idle_ticks_socket)
-//	            + énergie_idle   × (durée_action_ns / durée_fenêtre_ns)
+// On utilise les ticks non-idle (actifs) du socket comme dénominateur plutôt
+// que les ticks totaux. Cela évite de diluer le ratio du processus par les
+// ticks idle qui correspondent à d'autres charges sur le socket (système K8s,
+// autres pods, monitoring...).
 //
-// La composante idle capture l'énergie consommée pendant les attentes I/O
-// (appels réseau, accès fichiers) proportionnellement au temps d'occupation.
+// Les ticks du processus incluent utime+stime+cutime+cstime (enfants terminés)
+// et tous les threads vivants, ce qui capture espeak-ng et ffmpeg.
+//
+// Retourne 0 si les ticks sont insuffisants (action trop courte < ~10ms).
 func attributedEnergyUJ(energyStart, energyEnd int64, snapStart, snapEnd CPUSnapshot) int64 {
 	deltaRAPL := deltaRAPLUJ(energyStart, energyEnd)
 	if deltaRAPL <= 0 {
 		return 0
 	}
 
-	deltaTotal := snapEnd.TotalTicks - snapStart.TotalTicks
-	deltaIdle := snapEnd.IdleTicks - snapStart.IdleTicks
+	deltaTotal   := snapEnd.TotalTicks   - snapStart.TotalTicks
+	deltaIdle    := snapEnd.IdleTicks    - snapStart.IdleTicks
 	deltaProcess := snapEnd.ProcessTicks - snapStart.ProcessTicks
-	durationNs := snapEnd.WallNs - snapStart.WallNs
-	windowNs := durationNs // fenêtre = durée de l'action
 
-	if deltaTotal <= 0 || windowNs <= 0 {
+	if deltaTotal <= 0 || deltaProcess <= 0 {
 		return 0
 	}
 
-	// Ratio idle du socket pendant la fenêtre
-	// deltaNonIdle = ticks actifs (user+system+irq...) hors idle/iowait
+	// Ticks actifs = total - idle (user+system+irq+softirq+steal...)
 	deltaNonIdle := deltaTotal - deltaIdle
-	if deltaNonIdle < 0 {
-		deltaNonIdle = 0
+	if deltaNonIdle <= 0 {
+		// Socket entièrement idle pendant la fenêtre — contribution nulle
+		return 0
 	}
 
-	// Énergie active et idle du socket
-	ratioIdle := float64(deltaIdle) / float64(deltaTotal)
-	energyActiveUJ := float64(deltaRAPL) * (1.0 - ratioIdle)
-	energyIdleUJ := float64(deltaRAPL) * ratioIdle
-
-	// Part active : pondération par les ticks CPU du processus
-	var activeAttribUJ float64
-	if deltaNonIdle > 0 && deltaProcess > 0 {
-		cpuRatio := float64(deltaProcess) / float64(deltaNonIdle)
-		if cpuRatio > 1.0 {
-			cpuRatio = 1.0
-		}
-		activeAttribUJ = energyActiveUJ * cpuRatio
+	cpuRatio := float64(deltaProcess) / float64(deltaNonIdle)
+	if cpuRatio > 1.0 {
+		cpuRatio = 1.0
 	}
 
-	// Part idle : pondération par le temps d'occupation (wall-clock)
-	// windowNs = durée de l'action, on utilise le même windowNs comme référence
-	// car on n'a qu'une seule action dans cette fenêtre de mesure.
-	// On attribue donc 100% de l'idle du socket à cette action sur cette fenêtre.
-	idleAttribUJ := energyIdleUJ
+	attributed := int64(float64(deltaRAPL) * cpuRatio)
 
-	total := int64(activeAttribUJ + idleAttribUJ)
-	log.Printf("attributedEnergyUJ: deltaRAPL=%dµJ active=%.0fµJ idle=%.0fµJ => attributed=%dµJ (cpuRatio=%.4f idleRatio=%.4f)",
-		deltaRAPL, activeAttribUJ, idleAttribUJ, total,
-		float64(deltaProcess)/float64(max64(deltaNonIdle, 1)),
-		ratioIdle)
-	return total
+	log.Printf("attributedEnergyUJ: deltaRAPL=%dµJ process=%d nonIdle=%d cpuRatio=%.4f => attributed=%dµJ",
+		deltaRAPL, deltaProcess, deltaNonIdle, cpuRatio, attributed)
+
+	return attributed
 }
 
 func max64(a, b int64) int64 {
