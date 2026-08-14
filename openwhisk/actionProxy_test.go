@@ -55,7 +55,7 @@ func TestStartLatestAction_emit1(t *testing.T) {
 	buf := []byte("#!/bin/sh\nwhile read a; do echo 1 >&3 ; done\n")
 	ap.ExtractAction(&buf, "bin")
 	ap.StartLatestAction()
-	res, _ := ap.theExecutor.Interact([]byte("x"))
+	res, _, _ := ap.theExecutor.Interact([]byte("x"), nil)
 	assert.Equal(t, res, []byte("1\n"))
 	ap.theExecutor.Stop()
 }
@@ -79,7 +79,7 @@ func TestStartLatestAction_emit2(t *testing.T) {
 	buf := []byte("#!/bin/sh\nwhile read a; do echo 2 >&3 ; done\n")
 	ap.ExtractAction(&buf, "bin")
 	ap.StartLatestAction()
-	res, _ := ap.theExecutor.Interact([]byte("z"))
+	res, _, _ := ap.theExecutor.Interact([]byte("z"), nil)
 	assert.Equal(t, res, []byte("2\n"))
 	/**/
 	ap.theExecutor.Stop()
