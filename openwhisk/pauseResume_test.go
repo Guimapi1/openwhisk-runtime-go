@@ -53,7 +53,7 @@ func pausedRequestBody(traceID string, thresholdJ float64) string {
 		"energy_pause_mode": "CGROUP_FREEZE",
 		"energy_max_pause_duration_ms": 2000,
 		"energy_max_pause_count": 1,
-		"energy_interruption_class": "KILL_SAFE"
+		"energy_interruption_class": {"action": "KILL_SAFE"}
 	}}`
 }
 
@@ -248,7 +248,7 @@ func TestPauseResume_FreezeOnLaterSequenceStep_ViaEnergyStateSidecar(t *testing.
 			"pause_mode": "CGROUP_FREEZE",
 			"max_pause_duration_ms": 2000,
 			"max_pause_count": 1,
-			"interruption_class": "KILL_SAFE"
+			"interruption_class": {"action": "KILL_SAFE"}
 		}
 	}}`
 

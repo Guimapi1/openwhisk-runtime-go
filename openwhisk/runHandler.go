@@ -55,11 +55,23 @@ func sendError(w http.ResponseWriter, code int, cause string) {
 // /run HTTP response (PLAYBOOK.md Phase 7's resolved open question #2:
 // that channel cannot carry a pause round-trip, since /run's caller is
 // OpenWhisk itself, not the scheduler).
+//
+// ActionName (PLAYBOOK.md Phase 8) mirrors the field EXECUTION_PAUSED
+// already carries (§7.6) — added to close a gap §7.6's original
+// EXECUTION_KILLED shape left open: resolving compensation_sequence for
+// a COMPENSATABLE kill (§6.7) requires knowing precisely WHICH action
+// (component of the sequence, possibly not the first) was killed, and a
+// sequence is dispatched as a single invoke_action() call the scheduler
+// never sees the intermediate steps of (§2, "séquence") — without this
+// field, the scheduler would have no way to learn it for a component
+// killed directly (pauseEnabled=false, no preceding EXECUTION_PAUSED to
+// remember it from).
 type ExecutionKilledEvent struct {
 	Event                   string                 `json:"event"`
 	TraceID                 string                 `json:"trace_id"`
 	ReservationID           string                 `json:"reservation_id"`
 	PauseID                 string                 `json:"pause_id"`
+	ActionName              string                 `json:"action_name"`
 	ExecutionPhase          string                 `json:"execution_phase"`
 	EnergyBudgetExceeded    bool                   `json:"energy_budget_exceeded"`
 	EnergyConsumedJ         float64                `json:"energy_consumed_j"`
@@ -143,12 +155,12 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 	// execute the action
 	response, err, killInfo := ap.theExecutor.Interact(body, energyState)
 
-	// Energy threshold reached with pauseEnabled=false (CLAUDE.md §3.1,
-	// §7.2): the process is already dead, killed locally and
-	// synchronously by the monitor, with no prior notification to the
-	// scheduler. Build and return the EXECUTION_KILLED event (§7.6) as
-	// the activation's result — there is no separate event channel yet,
-	// this response IS the "canal de réponse sécurisé" §7.6 refers to.
+	// Energy threshold reached (CLAUDE.md §3.1, §7.2): the process is
+	// already dead, killed locally either synchronously (pauseEnabled=
+	// false) or after a failed/refused pause cycle (PLAYBOOK.md Phase 7).
+	// The EXECUTION_KILLED event (§7.6) is POSTed to the dedicated
+	// runtime -> scheduler channel (schedulerChannel.go), fire-and-forget
+	// — this /run response itself carries none of it (see below).
 	if killInfo != nil {
 		ap.theExecutor = nil // the process is dead; a fresh one is needed next time
 
@@ -158,6 +170,7 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 			TraceID:              energyState.TraceID,
 			ReservationID:        energyState.ReservationID,
 			PauseID:              killInfo.PauseID,
+			ActionName:           actionNameForEvents(),
 			ExecutionPhase:       energyState.ExecutionPhase,
 			EnergyBudgetExceeded: true,
 			EnergyConsumedJ:      totalConsumedJ,

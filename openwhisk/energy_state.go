@@ -70,17 +70,32 @@ const firstStepAnchorKey = "energy_trace_id"
 // (CLAUDE.md §2 "__energy_state", §7.5's energy_* fields). JSON tags use
 // the bare (non "energy_"-prefixed) names, matching __energy_state's own
 // shape on the wire.
+//
+// InterruptionClass (PLAYBOOK.md Phase 10) is a PER-COMPONENT map
+// ({action_name: interruption_class}) for the whole sequence, not a
+// single string — CLAUDE.md §6.4's original design ("energy_interruption_class
+// est envoyé... mais le runtime ne l'utilise pas pour choisir le
+// fallback") only ever carried the HEAD component's own class, correct
+// only for a single-component trace: ReinjectEnergyState copies the
+// WHOLE previous EnergyState forward unchanged except ConsumedBeforeJ,
+// so a non-head step would otherwise see the HEAD's class, never its
+// own. A sequence mixing KILL_SAFE and NON_INTERRUPTIBLE components
+// (§3.3) needs each step's runtime to resolve ITS OWN entry — via
+// __OW_ACTION_NAME, see energyMonitor.go's isNonInterruptibleForThisStep
+// — since it has no registry access of its own (§7.1). The map itself
+// is immutable for the whole trace, so it needs no per-step update in
+// ReinjectEnergyState, unlike ConsumedBeforeJ.
 type EnergyState struct {
-	TraceID             string  `json:"trace_id"`
-	ReservationID       string  `json:"reservation_id"`
-	ExecutionPhase      string  `json:"execution_phase"`
-	ExecutionThresholdJ float64 `json:"execution_threshold_j"`
-	ConsumedBeforeJ     float64 `json:"consumed_before_j"`
-	PauseEnabled        bool    `json:"pause_enabled"`
-	PauseMode           string  `json:"pause_mode"`
-	MaxPauseDurationMs  int64   `json:"max_pause_duration_ms"`
-	MaxPauseCount       int64   `json:"max_pause_count"`
-	InterruptionClass   string  `json:"interruption_class"`
+	TraceID             string            `json:"trace_id"`
+	ReservationID       string            `json:"reservation_id"`
+	ExecutionPhase      string            `json:"execution_phase"`
+	ExecutionThresholdJ float64           `json:"execution_threshold_j"`
+	ConsumedBeforeJ     float64           `json:"consumed_before_j"`
+	PauseEnabled        bool              `json:"pause_enabled"`
+	PauseMode           string            `json:"pause_mode"`
+	MaxPauseDurationMs  int64             `json:"max_pause_duration_ms"`
+	MaxPauseCount       int64             `json:"max_pause_count"`
+	InterruptionClass   map[string]string `json:"interruption_class"`
 }
 
 // decodeEnergyStateMap round-trips a generic map through JSON into an

@@ -105,11 +105,32 @@ func (r *energyMonitorResult) get() (bool, float64, string) {
 	return r.killed, r.consumedJ, r.pauseID
 }
 
-// shouldMonitorEnergy mirrors CLAUDE.md §7.2: a disabled or negative
-// threshold, or no energy state at all (§7.5's third case, energy==nil),
-// means monitoring without enforcement — i.e. no monitoring loop at all.
+// isNonInterruptibleForThisStep resolves THIS step's own interruption
+// class (PLAYBOOK.md Phase 10) from the per-component map carried in
+// EnergyState.InterruptionClass (energy_state.go), keyed by
+// __OW_ACTION_NAME — never a registry lookup, the runtime has no
+// registry access of its own (§7.1). A missing map, or a missing entry
+// for this action name, is NOT treated as NON_INTERRUPTIBLE: only an
+// explicit "NON_INTERRUPTIBLE" value for this exact action disables
+// enforcement — the safe default (enforced) applies otherwise.
+func isNonInterruptibleForThisStep(energy *EnergyState) bool {
+	if energy == nil || energy.InterruptionClass == nil {
+		return false
+	}
+	return energy.InterruptionClass[actionNameForEvents()] == "NON_INTERRUPTIBLE"
+}
+
+// shouldMonitorEnergy mirrors CLAUDE.md §7.2 and §3.3: a disabled or
+// negative threshold, no energy state at all (§7.5's third case,
+// energy==nil), or THIS step's action being NON_INTERRUPTIBLE all mean
+// no threshold ENFORCEMENT loop — i.e. no freeze, no kill (§3.3:
+// "aucun freeze énergétique, aucun kill énergétique"). Measurement
+// itself is unaffected: runHandler.go's start/end readEnergy snapshots
+// (§3.3's "mesure continue") run unconditionally, independent of this
+// monitoring loop, so a NON_INTERRUPTIBLE step is still fully measured
+// and reinjected into __energy_state even with no monitor goroutine.
 func shouldMonitorEnergy(energy *EnergyState) bool {
-	return energy != nil && energy.ExecutionThresholdJ > 0
+	return energy != nil && energy.ExecutionThresholdJ > 0 && !isNonInterruptibleForThisStep(energy)
 }
 
 // actionNameForEvents reads __OW_ACTION_NAME (a standard OpenWhisk

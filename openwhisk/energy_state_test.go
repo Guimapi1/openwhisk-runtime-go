@@ -52,7 +52,7 @@ func TestExtractEnergyState_FirstStepReadsDirectEnergyParams(t *testing.T) {
 		"energy_pause_mode":            "CGROUP_FREEZE",
 		"energy_max_pause_duration_ms": float64(500),
 		"energy_max_pause_count":       float64(1),
-		"energy_interruption_class":    "COMPENSATABLE",
+		"energy_interruption_class":    map[string]interface{}{"reserve_stock": "COMPENSATABLE"},
 	}
 
 	state, cleaned := ExtractEnergyState(params)
@@ -67,7 +67,7 @@ func TestExtractEnergyState_FirstStepReadsDirectEnergyParams(t *testing.T) {
 	assert.Equal(t, "CGROUP_FREEZE", state.PauseMode)
 	assert.Equal(t, int64(500), state.MaxPauseDurationMs)
 	assert.Equal(t, int64(1), state.MaxPauseCount)
-	assert.Equal(t, "COMPENSATABLE", state.InterruptionClass)
+	assert.Equal(t, map[string]string{"reserve_stock": "COMPENSATABLE"}, state.InterruptionClass)
 
 	// The simulated business code only ever sees `cleaned` — verify it
 	// never receives any energy_* key.
@@ -94,7 +94,7 @@ func TestExtractEnergyState_SubsequentStepReadsHiddenState(t *testing.T) {
 		"pause_mode":            "CGROUP_FREEZE",
 		"max_pause_duration_ms": float64(500),
 		"max_pause_count":       float64(1),
-		"interruption_class":    "COMPENSATABLE",
+		"interruption_class":    map[string]interface{}{"reserve_stock": "COMPENSATABLE"},
 	}
 	params := map[string]interface{}{
 		"quantity":     float64(3),
@@ -140,7 +140,7 @@ func TestReinjectEnergyState_IncrementsConsumedBeforeJ(t *testing.T) {
 		PauseMode:           "CGROUP_FREEZE",
 		MaxPauseDurationMs:  500,
 		MaxPauseCount:       1,
-		InterruptionClass:   "COMPENSATABLE",
+		InterruptionClass:   map[string]string{"reserve_stock": "COMPENSATABLE"},
 	}
 	result := rawMessageMap(t, map[string]interface{}{"status": "ok"})
 

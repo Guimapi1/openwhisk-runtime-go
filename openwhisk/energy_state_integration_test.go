@@ -74,7 +74,7 @@ func TestRunHandler_SidecarWiring_StripsEnergyParamsAndReinjectsState(t *testing
 		"energy_pause_mode": "CGROUP_FREEZE",
 		"energy_max_pause_duration_ms": 500,
 		"energy_max_pause_count": 1,
-		"energy_interruption_class": "COMPENSATABLE"
+		"energy_interruption_class": {"reserve_stock": "COMPENSATABLE"}
 	}}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
@@ -99,7 +99,7 @@ func TestRunHandler_SidecarWiring_StripsEnergyParamsAndReinjectsState(t *testing
 	require.True(t, ok)
 	assert.Equal(t, "trace-xyz", stateMap["trace_id"])
 	assert.Equal(t, "trace-xyz", stateMap["reservation_id"])
-	assert.Equal(t, "COMPENSATABLE", stateMap["interruption_class"])
+	assert.Equal(t, map[string]interface{}{"reserve_stock": "COMPENSATABLE"}, stateMap["interruption_class"])
 	consumedBefore, ok := stateMap["consumed_before_j"].(float64)
 	require.True(t, ok)
 	// >= original consumed_before_j: the step's measured energy is added
