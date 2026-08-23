@@ -19,6 +19,7 @@ package openwhisk
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 )
 
@@ -154,18 +155,43 @@ func ExtractEnergyState(params map[string]interface{}) (*EnergyState, map[string
 		delete(cleaned, energyStateKey)
 		asMap, ok := raw.(map[string]interface{})
 		if !ok {
-			log.Printf("[energy_state] %s present but not a JSON object (%T); ignoring", energyStateKey, raw)
+			logCorruptedEnergyState(fmt.Sprintf("%s present but not a JSON object (%T)", energyStateKey, raw))
 			return nil, cleaned
 		}
 		state, err := decodeEnergyStateMap(asMap)
 		if err != nil {
-			log.Printf("[energy_state] failed to decode %s: %v", energyStateKey, err)
+			logCorruptedEnergyState(fmt.Sprintf("failed to decode %s: %v", energyStateKey, err))
 			return nil, cleaned
 		}
 		return state, cleaned
 	}
 
 	return nil, cleaned
+}
+
+// logCorruptedEnergyState (CLAUDE.md §6.9, hardening phase, project-
+// specific case): __energy_state present but corrupted on a step that is
+// NOT the sequence's first (the first step never reaches this branch —
+// it reads energy_* directly, see firstStepAnchorKey above) means
+// OpenWhisk's own sequence-chaining propagation (§7.8, empirically
+// verified against a live cluster, see this file's own header) was
+// somehow defeated for this one invocation — the exact assumption the
+// whole sidecar mechanism depends on. The degraded behaviour itself is
+// already correct (nil state -> §7.2's disabled-threshold path,
+// monitoring without enforcement, exactly as absent __energy_state would
+// be) — what was missing was the SEVERITY: this must be a first-order
+// [safety] incident, not a routine [energy_state] log, because it means
+// the energy guarantee is no longer assured for this specific step.
+func logCorruptedEnergyState(reason string) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":  "ENERGY_STATE_CORRUPTED",
+		"reason": reason,
+	})
+	if err != nil {
+		log.Printf("[safety] __energy_state corrupted: %s (failed to marshal structured event: %v)", reason, err)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
 }
 
 // ReinjectEnergyState adds an up-to-date __energy_state into a step's

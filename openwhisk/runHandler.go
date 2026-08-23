@@ -179,9 +179,26 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 			EnergyOriginalArguments: req.Value,
 		}
 
+		// Record this activation's own measurement SYNCHRONOUSLY, and
+		// BEFORE postExecutionKilled is ever dispatched (CLAUDE.md §6.9,
+		// hardening phase point 2). postExecutionKilled() is itself
+		// fire-and-forget (no confirmation awaited before sending), and
+		// the scheduler's handle_execution_killed() queries
+		// collector.get_energy_for_trace(trace_id) the MOMENT it receives
+		// that event — with the ordinary async recordMetrics()
+		// (fire-and-forget push to the collector, metrics_helpers.go),
+		// nothing guaranteed this write had landed before that query ran:
+		// two independent fire-and-forget operations racing with no
+		// synchronization between them, a real risk of the scheduler
+		// settling on an incomplete measurement, not a theoretical one.
+		// recordMetricsSync blocks until the push actually completes.
+		ap.recordMetricsSync("/run", start, energyStart, cpuStart, meta)
+
 		// Fire-and-forget over the dedicated channel (CLAUDE.md §3.1: must
 		// never block this response — a synchronous call could stall for
-		// up to postExecutionKilled's own timeout on a network hiccup).
+		// up to postExecutionKilled's own timeout on a network hiccup) —
+		// but only AFTER the line above has already guaranteed the
+		// measurement it depends on is safely recorded.
 		// Original arguments travel ONLY over this channel, never in the
 		// /run response nor in logs by default (CLAUDE.md §7.6).
 		go postExecutionKilled(event)
@@ -198,10 +215,6 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		// above, never from this body (PLAYBOOK.md Phase 7's resolved
 		// open question #2).
 		sendError(w, http.StatusBadRequest, "energy budget exceeded: action killed")
-
-		// The energy actually consumed up to the kill is still real,
-		// measurable data — record it like any other invocation.
-		ap.recordMetrics("/run", start, energyStart, cpuStart, meta)
 		return
 	}
 
@@ -256,6 +269,22 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// --- Enregistrement des métriques avec pondération CPU (CLAUDE.md
+	// §6.9 hardening pass, point 3) ---
+	//
+	// recordMetricsSync, BEFORE the /run response is written — mirrors
+	// the EXECUTION_KILLED path's own fix (point 2): whatever reads this
+	// activation's measurement right after invoke_action() returns (the
+	// scheduler's own settle_forward(), via collector.get_energy_for_trace())
+	// must not race an async push with no ordering guarantee. The window
+	// here is smaller than the kill path's (OpenWhisk's own activation
+	// processing adds real indirection between this handler's response
+	// and the scheduler ever seeing it), but "smaller" is not "zero" —
+	// the ordinary async recordMetrics() (fire-and-forget `go
+	// pushMetrics(...)`, metrics_helpers.go) gave no actual guarantee
+	// either way.
+	ap.recordMetricsSync("/run", start, energyStart, cpuStart, meta)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(response)))
 	numBytesWritten, err := w.Write(response)
@@ -274,7 +303,4 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		sendError(w, http.StatusInternalServerError, fmt.Sprintf("Only wrote %d of %d bytes to response", numBytesWritten, len(response)))
 		return
 	}
-
-	// --- Enregistrement des métriques avec pondération CPU ---
-	ap.recordMetrics("/run", start, energyStart, cpuStart, meta)
 }

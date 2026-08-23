@@ -18,7 +18,11 @@
 package openwhisk
 
 import (
+	"bytes"
 	"encoding/json"
+	"log"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -124,6 +128,68 @@ func TestExtractEnergyState_NeitherPresentLeavesParamsUnchanged(t *testing.T) {
 
 	assert.Nil(t, state)
 	assert.Equal(t, params, cleaned)
+}
+
+// Required test #7 (CLAUDE.md §6.9 hardening pass, project-specific
+// case): __energy_state present but CORRUPTED on a non-first step (this
+// invocation has no energy_trace_id, so it's never the first-step branch
+// — see firstStepAnchorKey) means OpenWhisk's own sequence-chaining
+// propagation was somehow defeated for this trace. Must not crash, must
+// degrade to "no enforcement" (nil state, same as §7.2's disabled-
+// threshold path), and must emit a first-order [safety] log — not the
+// routine [energy_state] one — since the energy guarantee is no longer
+// assured for this step.
+func TestExtractEnergyState_CorruptedOnNonFirstStep_DegradesAndLogsSafety(t *testing.T) {
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	params := map[string]interface{}{
+		"quantity":     3,
+		energyStateKey: "not an object — corrupted",
+	}
+
+	state, cleaned := ExtractEnergyState(params)
+
+	assert.Nil(t, state, "corrupted __energy_state must degrade to nil (no enforcement), not crash")
+	assert.Equal(t, map[string]interface{}{"quantity": 3}, cleaned)
+
+	logged := logBuf.String()
+	require.Contains(t, logged, "[safety] ", "must be a first-order [safety] log, not [energy_state]")
+	var payload map[string]interface{}
+	safetyLine := logged[strings.Index(logged, "[safety] ")+len("[safety] "):]
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(safetyLine)), &payload))
+	assert.Equal(t, "ENERGY_STATE_CORRUPTED", payload["event"])
+}
+
+// Same scenario, but a decode failure (well-formed object, wrong field
+// types) rather than a wrong top-level type — both corruption shapes
+// must degrade identically.
+func TestExtractEnergyState_UndecodableOnNonFirstStep_DegradesAndLogsSafety(t *testing.T) {
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	params := map[string]interface{}{
+		"quantity": 3,
+		energyStateKey: map[string]interface{}{
+			// execution_threshold_j should be a number — a string here
+			// makes the whole object fail to decode into EnergyState.
+			"execution_threshold_j": "not-a-number",
+		},
+	}
+
+	state, cleaned := ExtractEnergyState(params)
+
+	assert.Nil(t, state, "undecodable __energy_state must degrade to nil (no enforcement), not crash")
+	assert.Equal(t, map[string]interface{}{"quantity": 3}, cleaned)
+
+	logged := logBuf.String()
+	require.Contains(t, logged, "[safety] ")
+	var payload map[string]interface{}
+	safetyLine := logged[strings.Index(logged, "[safety] ")+len("[safety] "):]
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(safetyLine)), &payload))
+	assert.Equal(t, "ENERGY_STATE_CORRUPTED", payload["event"])
 }
 
 // 4. Reinjection: the returned result carries an up-to-date

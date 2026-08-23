@@ -300,8 +300,37 @@ func countAllCores() int {
 }
 
 
-// recordMetrics calcule et enregistre les métriques énergétiques d'un endpoint.
+// recordMetrics calcule et enregistre les métriques énergétiques d'un
+// endpoint, en poussant vers le collecteur de façon fire-and-forget (goroutine
+// séparée) — le comportement historique, correct partout où rien n'attend
+// synchroniquement que l'écriture soit effective avant de continuer.
 func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta) {
+	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, false)
+}
+
+// recordMetricsSync est identique à recordMetrics, mais pousse la mesure de
+// CETTE activation vers le collecteur de façon SYNCHRONE (bloquante) plutôt
+// que via une goroutine fire-and-forget.
+//
+// Nécessaire précisément avant l'envoi de EXECUTION_KILLED (CLAUDE.md §6.9,
+// passe de durcissement, point 2) : postExecutionKilled() est elle-même
+// fire-and-forget côté runtime (aucune confirmation attendue avant l'envoi,
+// confirmé phases 6/7), et le scheduler interroge
+// collector.get_energy_for_trace(trace_id) dès réception de cet événement.
+// Avec recordMetrics() ordinaire, rien ne garantit que l'écriture de CETTE
+// mesure ait atteint le collecteur avant que le scheduler ne l'interroge —
+// deux fire-and-forget indépendants (le push metrics ET l'envoi de
+// l'événement) sans aucune synchronisation entre eux, donc une vraie
+// fenêtre de course, pas juste une possibilité théorique. recordMetricsSync
+// doit être appelée AVANT le déclenchement de postExecutionKilled(), jamais
+// après (voir runHandler.go, branche killInfo != nil).
+func (ap *ActionProxy) recordMetricsSync(endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta) {
+	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, true)
+}
+
+func (ap *ActionProxy) recordMetricsImpl(
+	endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta, sync bool,
+) {
 	energyEnd, err := readEnergy()
 	if err != nil {
 		log.Printf("readEnergy end %s: %v", endpoint, err)
@@ -342,11 +371,19 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 			pending := *ap.pendingInitEntry
 			ap.pendingInitEntry = nil
 			ap.pendingInitMu.Unlock()
-			go pushMetrics("/init", pending)
+			if sync {
+				pushMetrics("/init", pending)
+			} else {
+				go pushMetrics("/init", pending)
+			}
 		} else {
 			ap.pendingInitMu.Unlock()
 		}
-		go pushMetrics("/run", entry)
+		if sync {
+			pushMetrics("/run", entry)
+		} else {
+			go pushMetrics("/run", entry)
+		}
 	} else {
 		ap.pendingInitMu.Lock()
 		ap.pendingInitEntry = &entry
