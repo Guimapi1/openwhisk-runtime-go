@@ -155,6 +155,54 @@ func readProcessTicks(pid int) (int64, error) {
 	return 0, fmt.Errorf("no cgroup cpu usage found for pid %d", pid)
 }
 
+// ResolveCgroupCPUStatPath is diagnostic-only tooling (CLAUDE.md §7.3
+// investigation, cmd/verify_cgroup_pod): mirrors readProcessTicks()'s own
+// cgroups-v2-then-v1 resolution to report WHICH FILE it would read for
+// pid, without touching readProcessTicks() itself while that function's
+// behaviour is under active investigation — the production code path
+// above is deliberately left untouched. Necessarily a duplicate of that
+// resolution logic, not a shared helper; if the two ever drift, this
+// comment is the tripwire to keep them in sync by hand.
+func ResolveCgroupCPUStatPath(pid int) (string, error) {
+	if pid <= 0 {
+		return "", fmt.Errorf("invalid pid %d", pid)
+	}
+
+	cgroupData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return "", fmt.Errorf("read cgroup for pid %d: %v", pid, err)
+	}
+
+	for _, line := range strings.Split(string(cgroupData), "\n") {
+		if !strings.HasPrefix(line, "0::/") {
+			continue
+		}
+		slice := strings.TrimPrefix(line, "0::/")
+		slice = strings.TrimSpace(slice)
+		cpuStatPath := "/sys/fs/cgroup/" + slice + "/cpu.stat"
+		if _, err := readCgroupV2CPUUsec(cpuStatPath); err == nil {
+			return cpuStatPath, nil
+		}
+	}
+
+	for _, line := range strings.Split(string(cgroupData), "\n") {
+		fields := strings.SplitN(line, ":", 3)
+		if len(fields) != 3 {
+			continue
+		}
+		if fields[1] != "cpuacct" && !strings.Contains(fields[1], "cpuacct") {
+			continue
+		}
+		slice := strings.TrimSpace(fields[2])
+		cpuacctPath := "/sys/fs/cgroup/cpuacct/" + slice + "/cpuacct.usage"
+		if _, err := os.ReadFile(cpuacctPath); err == nil {
+			return cpuacctPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("no cgroup cpu usage file found for pid %d", pid)
+}
+
 // readCgroupV2CPUUsec lit usage_usec depuis un fichier cpu.stat cgroups v2.
 func readCgroupV2CPUUsec(path string) (int64, error) {
 	dat, err := os.ReadFile(path)

@@ -141,6 +141,15 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		energyState, cleanedValue = ExtractEnergyState(req.Value)
 		if energyState != nil {
 			req.Value = cleanedValue
+			if meta.TraceID == "" {
+				// Non-first sequence step: energy_trace_id isn't a
+				// top-level param here (only __energy_state carries it,
+				// CLAUDE.md §7.8) — fall back to the value ExtractEnergyState
+				// already decoded, so this step's own metrics are tagged
+				// with the same trace_id as the rest of the sequence
+				// instead of being pushed to the collector untagged.
+				meta.TraceID = energyState.TraceID
+			}
 			if newBody, marshalErr := json.Marshal(req); marshalErr == nil {
 				body = newBody
 			} else {

@@ -362,6 +362,18 @@ func (a *ActivationController) Pid() int {
 	return a.cmd.Process.Pid
 }
 
+// CgroupPath returns the absolute path to this activation's own dedicated
+// cgroup v2 directory — the one CLONE_INTO_CGROUP placed the tracked
+// process into at Start() time. Diagnostic-only accessor (added to
+// compare this against what readProcessTicks() independently resolves
+// for the same PID, per CLAUDE.md §7.3's own mechanism — see
+// cmd/verify_cgroup_pod).
+func (a *ActivationController) CgroupPath() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cg.path
+}
+
 // Close removes the activation's cgroup directory. Only valid once the
 // cgroup is empty (state STOPPED, or never started).
 func (a *ActivationController) Close() error {

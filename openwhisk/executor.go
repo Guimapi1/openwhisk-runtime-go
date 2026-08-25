@@ -128,6 +128,16 @@ func (proc *Executor) Pid() int {
 	return 0
 }
 
+// CgroupPath returns the dedicated cgroup this process was placed into
+// at creation time, or "" if the controller isn't set. Diagnostic-only
+// accessor — see ActivationController.CgroupPath.
+func (proc *Executor) CgroupPath() string {
+	if proc.controller == nil {
+		return ""
+	}
+	return proc.controller.CgroupPath()
+}
+
 // Interact interacts with the underlying process.
 //
 // energy carries the energy_* fields extracted by the sidecar (phase 3,
