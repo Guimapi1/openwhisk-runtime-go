@@ -81,6 +81,18 @@ type ExecutionKilledEvent struct {
 type runRequest struct {
 	ActivationID string                 `json:"activation_id"`
 	Value        map[string]interface{} `json:"value"`
+	// ActionName: OpenWhisk's own per-activation /run payload field
+	// (docs/ACTION.md, a sibling of "value", always present, namespace/
+	// package-qualified — e.g. "/guest/order/notify_carrier"), decoded
+	// here so THIS step's own interruption class can be reliably
+	// resolved (energyMonitor.go's isNonInterruptibleForThisStep, via
+	// EnergyState.ResolvedActionName) instead of __OW_ACTION_NAME, which
+	// is never set in this proxy's own process — only in the CHILD
+	// action's environment, derived by the language layer from this
+	// same payload. A real incident: the old env-var lookup always
+	// missed in production, silently enforcing on NON_INTERRUPTIBLE
+	// steps it should never have touched.
+	ActionName string `json:"action_name"`
 }
 
 func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +153,13 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		energyState, cleanedValue = ExtractEnergyState(req.Value)
 		if energyState != nil {
 			req.Value = cleanedValue
+			// THIS step's own action name, reliably resolved and
+			// short-normalized (energyMonitor.go's
+			// isNonInterruptibleForThisStep, EnergyState's own
+			// ResolvedActionName doc comment) — recomputed fresh every
+			// step from ITS OWN /run payload, never carried over via
+			// __energy_state.
+			energyState.ResolvedActionName = shortActionName(req.ActionName)
 			if meta.TraceID == "" {
 				// Non-first sequence step: energy_trace_id isn't a
 				// top-level param here (only __energy_state carries it,
@@ -179,7 +198,7 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 			TraceID:              energyState.TraceID,
 			ReservationID:        energyState.ReservationID,
 			PauseID:              killInfo.PauseID,
-			ActionName:           actionNameForEvents(),
+			ActionName:           energyState.ResolvedActionName,
 			ExecutionPhase:       energyState.ExecutionPhase,
 			EnergyBudgetExceeded: true,
 			EnergyConsumedJ:      totalConsumedJ,

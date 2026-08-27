@@ -230,7 +230,7 @@ func TestRunHandler_EnergyMonitor_StaysUnderThreshold_ReinjectsEnergyState(t *te
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)
@@ -289,7 +289,7 @@ func TestRunHandler_EnergyMonitor_ExceedsThreshold_EmitsExecutionKilled(t *testi
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)
@@ -342,7 +342,7 @@ func TestRunHandler_EnergyMonitor_DisabledThreshold_NeverKills(t *testing.T) {
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)
@@ -429,7 +429,7 @@ func TestRunHandler_EnergyMonitor_ThresholdReadFromBothSidecarSources(t *testing
 				"energy_max_pause_duration_ms": 0,
 				"energy_max_pause_count": 0,
 				"energy_interruption_class": {"action": "KILL_SAFE"}
-			}}`,
+			}, "action_name": "action"}`,
 			expectedTraceID: "trace-first",
 		},
 		{
@@ -447,7 +447,7 @@ func TestRunHandler_EnergyMonitor_ThresholdReadFromBothSidecarSources(t *testing
 					"max_pause_count": 0,
 					"interruption_class": {"action": "KILL_SAFE"}
 				}
-			}}`,
+			}, "action_name": "action"}`,
 			expectedTraceID: "trace-next",
 		},
 	}

@@ -1,6 +1,7 @@
 package openwhisk
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -59,14 +60,102 @@ func readRAPLMax() int64 {
 	return v
 }
 
+// raplOverflowProximityThreshold (env RAPL_OVERFLOW_PROXIMITY_THRESHOLD,
+// défaut 0.9) : fraction de max_energy_range_uj au-delà de laquelle
+// `start` est considéré assez proche du sommet du compteur pour qu'un
+// `end < start` soit plausiblement un vrai débordement matériel plutôt
+// qu'une simple fluctuation de lecture. Un vrai débordement ne peut se
+// produire qu'en repassant par ce sommet — jamais depuis une valeur
+// arbitraire (voir deltaRAPLUJ ci-dessous). 0.9 est un choix
+// conservateur documenté, pas calibré expérimentalement (même statut
+// que les autres marges de ce fichier, §8) : suffisamment haut pour
+// qu'aucune consommation réelle plausible sur une seule fenêtre de
+// mesure ne l'atteigne par hasard, suffisamment bas pour couvrir la
+// marge d'imprécision du compteur lui-même.
+func raplOverflowProximityThreshold() float64 {
+	if v := os.Getenv("RAPL_OVERFLOW_PROXIMITY_THRESHOLD"); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil && parsed > 0 && parsed <= 1.0 {
+			return parsed
+		}
+	}
+	return 0.9
+}
+
+// logNonMonotonicRAPLReading (CLAUDE.md §11 : aucun fallback implicite,
+// toute décision visible dans l'état et les logs) — un incident
+// [safety] de premier ordre, distinct de tout autre log de ce fichier :
+// une lecture RAPL non strictement monotone qui n'a PAS la signature
+// d'un vrai débordement (start loin du sommet du compteur) est une
+// instabilité de lecture matérielle/noyau réelle, pas un événement
+// routinier — elle ne doit plus jamais rester silencieuse, même une
+// fois ce correctif en place, car c'est un indicateur direct pour
+// l'évaluation expérimentale de la fiabilité de la mesure elle-même
+// (même statut que les incidents NON_INTERRUPTIBLE/RECOVERY_BUDGET_
+// EXHAUSTED/franchissement de créneau, §11 dernier point).
+func logNonMonotonicRAPLReading(start, end, max, threshold int64) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":        "RAPL_NON_MONOTONIC_READING",
+		"start_uj":     start,
+		"end_uj":       end,
+		"max_uj":       max,
+		"threshold_uj": threshold,
+		"detail": "end < start but start was not near max_energy_range_uj -- " +
+			"treated as an unreliable reading, not a register overflow; " +
+			"this tick's delta is 0, not corrected via wraparound",
+	})
+	if err != nil {
+		log.Printf(
+			"[safety] RAPL non-monotonic reading start=%d end=%d (failed to marshal structured event: %v)",
+			start, end, err,
+		)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
+}
+
 // deltaRAPLUJ calcule la consommation énergétique entre deux relevés en µJ,
 // en corrigeant l'éventuel overflow du registre RAPL.
+//
+// Un vrai débordement matériel ne peut se produire qu'en repassant par
+// le sommet du compteur (max_energy_range_uj) — `end < start` seul ne
+// le prouve pas : une lecture RAPL non strictement monotone (un
+// "recul" de quelques dizaines à centaines de µJ entre deux lectures)
+// est une instabilité de lecture réelle et documentée du matériel/
+// noyau, pas un débordement. Un incident réel trouvé sur cluster (§0 —
+// voir le journal des décisions) : sans cette double condition,
+// n'importe quelle fluctuation triviale de ce type injectait
+// silencieusement toute la plage max_energy_range_uj (couramment
+// plusieurs dizaines à centaines de kJ) dans le delta calculé — un
+// delta d'environ 2875-2884J mesuré à partir d'une consommation réelle
+// de l'ordre de quelques dizaines de joules.
 func deltaRAPLUJ(start, end int64) int64 {
 	if end >= start {
 		return end - start
 	}
 	max := readRAPLMax()
-	return (max - start) + end
+	threshold := int64(float64(max) * raplOverflowProximityThreshold())
+	if start >= threshold {
+		// Signature d'un vrai débordement : start était déjà proche du
+		// sommet du compteur, un retour en arrière est physiquement
+		// attendu dans ce cas précis.
+		return (max - start) + end
+	}
+	// end < start mais start était loin de max_energy_range_uj : une
+	// lecture non monotone, pas un vrai débordement. La traiter comme
+	// un débordement injecterait toute la plage max à partir d'une
+	// simple fluctuation (l'incident réel que ce correctif prévient).
+	//
+	// Choix explicite (documenté, pas une troisième option inventée) :
+	// ce tick est traité comme delta=0, cohérent avec tous les autres
+	// cas de données insuffisantes/non fiables que cette fonction
+	// traite déjà ainsi (deltaProcessUsec<=0, durationUsec<=0 dans
+	// attributedEnergyUJ ci-dessous) — plutôt que de fabriquer un
+	// nombre négatif, ou de faire persister silencieusement un
+	// rebasage de `start` à travers des appels ultérieurs, ce que
+	// cette fonction pure ne possède pas les moyens de faire sans
+	// muter un état partagé qu'elle ne détient pas.
+	logNonMonotonicRAPLReading(start, end, max, threshold)
+	return 0
 }
 
 // readStatTicks extrait utime+stime depuis le contenu d'un fichier /proc/*/stat.

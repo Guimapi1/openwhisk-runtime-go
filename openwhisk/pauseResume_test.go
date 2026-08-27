@@ -54,7 +54,7 @@ func pausedRequestBody(traceID string, thresholdJ float64) string {
 		"energy_max_pause_duration_ms": 2000,
 		"energy_max_pause_count": 1,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 }
 
 func jsonFloat(f float64) string {
@@ -250,7 +250,7 @@ func TestPauseResume_FreezeOnLaterSequenceStep_ViaEnergyStateSidecar(t *testing.
 			"max_pause_count": 1,
 			"interruption_class": {"action": "KILL_SAFE"}
 		}
-	}}`
+	}, "action_name": "action"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)

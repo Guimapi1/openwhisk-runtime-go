@@ -132,7 +132,7 @@ func TestRunHandler_RecordMetricsSyncCompletesBeforeExecutionKilledIsSent(t *tes
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 
 	_, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)
@@ -267,7 +267,7 @@ func TestRunHandler_RecordMetricsSyncCompletesBeforeExecutionKilledIsSent_RealCo
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}}`
+	}, "action_name": "action"}`
 
 	requestStart := time.Now()
 	_, status, err := doPost(ts.URL+"/run", requestBody)

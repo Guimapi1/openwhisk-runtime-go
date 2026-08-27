@@ -190,8 +190,12 @@ func main() {
 		ExecutionPhase: "forward", ExecutionThresholdJ: 1.0, ConsumedBeforeJ: 1.0,
 		PauseEnabled: true, PauseMode: "CGROUP_FREEZE", MaxPauseDurationMs: 2000, MaxPauseCount: 1,
 		// Per-component map (CLAUDE.md §0 decision 15) keyed by
-		// __OW_ACTION_NAME — unset in this standalone binary's own
-		// environment, so the lookup key is "".
+		// ResolvedActionName (energy_state.go) — this binary calls
+		// Interact() directly, bypassing runHandler.go entirely, so
+		// ResolvedActionName is never set here and stays "" (its zero
+		// value); matching the map key here keeps this diagnostic's own
+		// lookup succeeding, same as before the action_name resolution
+		// fix, since this bypass path was never affected by that bug.
 		InterruptionClass: map[string]string{"": "KILL_SAFE"},
 	}
 	out, ierr, killInfo := proc2.Interact([]byte(`{"value":{}}`), energy)

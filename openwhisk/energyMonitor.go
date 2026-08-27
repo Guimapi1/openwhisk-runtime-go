@@ -18,9 +18,11 @@
 package openwhisk
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -105,19 +107,90 @@ func (r *energyMonitorResult) get() (bool, float64, string) {
 	return r.killed, r.consumedJ, r.pauseID
 }
 
+// shortActionName mirrors scheduler/core/registry.py::_short_name()
+// EXACTLY (CLAUDE.md §6.3: "cette normalisation doit être appliquée de
+// façon identique partout où un nom d'action est comparé... pas
+// réinventée séparément à chaque phase") — text after the last "/", the
+// whole qualified string unchanged if no "/" is present, "" if the
+// input is "" or ends in "/". Deliberately NOT path.Base/filepath.Base:
+// both diverge from _short_name on "" (returns "." not ""), a trailing
+// "/" (returns the preceding segment, not ""), and "/" alone (returns
+// "/" not "").
+func shortActionName(qualified string) string {
+	return qualified[strings.LastIndex(qualified, "/")+1:]
+}
+
 // isNonInterruptibleForThisStep resolves THIS step's own interruption
 // class (PLAYBOOK.md Phase 10) from the per-component map carried in
 // EnergyState.InterruptionClass (energy_state.go), keyed by
-// __OW_ACTION_NAME — never a registry lookup, the runtime has no
-// registry access of its own (§7.1). A missing map, or a missing entry
-// for this action name, is NOT treated as NON_INTERRUPTIBLE: only an
-// explicit "NON_INTERRUPTIBLE" value for this exact action disables
-// enforcement — the safe default (enforced) applies otherwise.
+// energy.ResolvedActionName — reliably decoded by runHandler.go from
+// OpenWhisk's own per-activation /run payload (docs/ACTION.md's
+// "action_name" field, always present) and short-normalized the same
+// way the scheduler's own map keys are (shortActionName() above).
+//
+// Previously keyed by __OW_ACTION_NAME (os.Getenv), which is NEVER SET
+// in this proxy's own process — only in the CHILD action's environment,
+// derived by the language layer FROM this same JSON payload — so the
+// lookup always missed in production despite passing every test (every
+// test injected the env var directly via t.Setenv, a blind spot the
+// real fix (runHandler.go decoding action_name) closes). A real
+// incident: this made a NON_INTERRUPTIBLE action's own freeze/kill
+// enforcement fire exactly as if no interruption_class had ever been
+// declared for it.
+//
+// Defense in depth (CLAUDE.md §3.3, hardening fix): if the resolved
+// name is still empty, or genuinely absent from the map, the default
+// is now to NOT enforce — the reverse of the previous "safe default is
+// enforced" assumption, which had it backwards. A trace that runs
+// unmonitored already has a safe, tested catch-all (committed_j
+// credited uncapped at settlement, a dedicated [safety] log — CLAUDE.md
+// §3.3). A NON_INTERRUPTIBLE action frozen or killed by mistake has no
+// recovery path at all. Between under-enforcing a genuinely
+// interruptible action and destroying a genuinely NON_INTERRUPTIBLE
+// one, the former is the strictly safer failure mode. Should now be
+// rare after the action_name fix above — every occurrence is logged as
+// a critical [safety] incident (logUnresolvedInterruptionClass), not
+// silently absorbed, since it signals the resolution mechanism itself
+// failed, not an expected/accounted-for outcome.
 func isNonInterruptibleForThisStep(energy *EnergyState) bool {
 	if energy == nil || energy.InterruptionClass == nil {
 		return false
 	}
-	return energy.InterruptionClass[actionNameForEvents()] == "NON_INTERRUPTIBLE"
+	class, ok := energy.InterruptionClass[energy.ResolvedActionName]
+	if !ok || energy.ResolvedActionName == "" {
+		logUnresolvedInterruptionClass(energy)
+		return true
+	}
+	return class == "NON_INTERRUPTIBLE"
+}
+
+// logUnresolvedInterruptionClass emits a critical-severity [safety] log
+// whenever this step's own interruption class could not be resolved —
+// distinct from NON_INTERRUPTIBLE_OVERAGE (core/reservation.py's
+// existing log, which signals an EXPECTED, accounted-for overage): this
+// one signals a failure of the resolution mechanism itself. Mirrors
+// energy_state.go::logCorruptedEnergyState()'s own structured-JSON
+// pattern.
+func logUnresolvedInterruptionClass(energy *EnergyState) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":                  "INTERRUPTION_CLASS_UNRESOLVED",
+		"severity":               "critical",
+		"trace_id":               energy.TraceID,
+		"reservation_id":         energy.ReservationID,
+		"resolved_action_name":   energy.ResolvedActionName,
+		"interruption_class_map": energy.InterruptionClass,
+		"detail": "this step's own interruption class could not be resolved from " +
+			"InterruptionClass — defaulting to NOT enforcing (fail-safe) rather than " +
+			"risk freezing/killing a NON_INTERRUPTIBLE action by mistake",
+	})
+	if err != nil {
+		log.Printf(
+			"[safety] interruption class unresolved for trace=%s (failed to marshal structured event: %v)",
+			energy.TraceID, err,
+		)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
 }
 
 // shouldMonitorEnergy mirrors CLAUDE.md §7.2 and §3.3: a disabled or
@@ -131,18 +204,6 @@ func isNonInterruptibleForThisStep(energy *EnergyState) bool {
 // and reinjected into __energy_state even with no monitor goroutine.
 func shouldMonitorEnergy(energy *EnergyState) bool {
 	return energy != nil && energy.ExecutionThresholdJ > 0 && !isNonInterruptibleForThisStep(energy)
-}
-
-// actionNameForEvents reads __OW_ACTION_NAME (a standard OpenWhisk
-// action-container env var, already captured wholesale into ap.env by
-// actionProxy.go's "__OW_" prefix scan) directly via os.Getenv — CLAUDE.md
-// §7.6's EXECUTION_PAUSED/EXECUTION_KILLED events carry action_name for
-// observability, but the scheduler's own handle_execution_paused() never
-// keys any decision off of it (it resolves pause policy from its OWN
-// registry via the reservation's sequence name) — so a best-effort value
-// is all that's needed here.
-func actionNameForEvents() string {
-	return os.Getenv("__OW_ACTION_NAME")
 }
 
 // monitorEnergy periodically measures the energy attributed to proc's
@@ -172,7 +233,7 @@ func (proc *Executor) monitorEnergy(
 	// cycles (runPauseCycle updates it on a successful resume) without
 	// touching the caller's own EnergyState.
 	energy := *initialEnergy
-	actionName := actionNameForEvents()
+	actionName := energy.ResolvedActionName
 
 	energyStart, err := readEnergy()
 	if err != nil {

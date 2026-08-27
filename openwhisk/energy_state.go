@@ -82,10 +82,11 @@ const firstStepAnchorKey = "energy_trace_id"
 // so a non-head step would otherwise see the HEAD's class, never its
 // own. A sequence mixing KILL_SAFE and NON_INTERRUPTIBLE components
 // (§3.3) needs each step's runtime to resolve ITS OWN entry — via
-// __OW_ACTION_NAME, see energyMonitor.go's isNonInterruptibleForThisStep
-// — since it has no registry access of its own (§7.1). The map itself
-// is immutable for the whole trace, so it needs no per-step update in
-// ReinjectEnergyState, unlike ConsumedBeforeJ.
+// ResolvedActionName below, see energyMonitor.go's
+// isNonInterruptibleForThisStep — since it has no registry access of
+// its own (§7.1). The map itself is immutable for the whole trace, so
+// it needs no per-step update in ReinjectEnergyState, unlike
+// ConsumedBeforeJ.
 type EnergyState struct {
 	TraceID             string            `json:"trace_id"`
 	ReservationID       string            `json:"reservation_id"`
@@ -97,6 +98,19 @@ type EnergyState struct {
 	MaxPauseDurationMs  int64             `json:"max_pause_duration_ms"`
 	MaxPauseCount       int64             `json:"max_pause_count"`
 	InterruptionClass   map[string]string `json:"interruption_class"`
+	// ResolvedActionName: THIS step's own action name, short-normalized
+	// (shortActionName(), energyMonitor.go) from OpenWhisk's own
+	// per-activation /run payload (runHandler.go decodes it from
+	// runRequest.ActionName, docs/ACTION.md's documented, always-present
+	// "action_name" field) — NOT from __OW_ACTION_NAME, which is never
+	// set in this proxy's own process (only in the child action's own
+	// environment, derived by the language layer from this same
+	// payload). Deliberately excluded from the wire format (json:"-"):
+	// it is step-local, recomputed fresh by each step's own
+	// runHandler.go from ITS OWN /run payload — never something to
+	// carry across __energy_state's sidecar chaining, unlike every
+	// other field above.
+	ResolvedActionName string `json:"-"`
 }
 
 // decodeEnergyStateMap round-trips a generic map through JSON into an
