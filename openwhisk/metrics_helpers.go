@@ -113,6 +113,37 @@ func logNonMonotonicRAPLReading(start, end, max, threshold int64) {
 	log.Printf("[safety] %s", encoded)
 }
 
+// logEnergyAttributionFallbackUsed (CLAUDE.md §11: aucun fallback
+// implicite) — logged every time recordMetricsImpl's defense-in-depth
+// safety net actually fires (a genuinely zero final CPU-ratio attribution
+// substituted by the live, pre-kill EnergyKillInfo.EnergyConsumedJ). This
+// is meant to stay rare after the ordering/cgroup-path fix — every
+// occurrence signals that the primary mechanism did not behave as
+// expected and deserves investigation, not silent absorption.
+func logEnergyAttributionFallbackUsed(meta *RunMeta, zeroAttributedUJ int64, fallbackJ float64) {
+	fields := map[string]interface{}{
+		"event":              "ENERGY_ATTRIBUTION_FALLBACK_USED",
+		"attributed_uj":      zeroAttributedUJ,
+		"fallback_j":         fallbackJ,
+		"detail": "final CPU-ratio attribution computed as 0 despite the " +
+			"ordering/cgroup-path fix -- substituted with the value already " +
+			"measured live, before the kill, by monitorEnergy()'s own ticker",
+	}
+	if meta != nil {
+		fields["trace_id"] = meta.TraceID
+		fields["activation_id"] = meta.ActivationID
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		log.Printf(
+			"[safety] energy attribution fallback used, fallback_j=%.4f (failed to marshal structured event: %v)",
+			fallbackJ, err,
+		)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
+}
+
 // deltaRAPLUJ calcule la consommation énergétique entre deux relevés en µJ,
 // en corrigeant l'éventuel overflow du registre RAPL.
 //
@@ -352,6 +383,44 @@ func readCPUSnapshot(pid int) CPUSnapshot {
 	return snap
 }
 
+// readCPUSnapshotFromCgroup is readCPUSnapshot's PID-independent
+// counterpart, reading cpu.stat directly from an already-known cgroup
+// path rather than discovering it via /proc/{pid}/cgroup.
+//
+// Necessary for any snapshot taken AFTER killExecution() has run:
+// killExecution() (cgroupFreezer.go) calls cmd.Wait() internally as part
+// of confirming the kill, which fully reaps the process before
+// killExecution() ever returns — by the time control reaches this
+// snapshot, /proc/{pid} is already gone (not merely a zombie), so
+// readProcessTicks(pid)'s own /proc/{pid}/cgroup lookup would fail and
+// silently report 0. The activation's own cgroup directory persists
+// independently of that PID's lifetime (removed only later, by
+// Executor.Stop()/ActivationController.Close() — a separate, later
+// lifecycle event, CLAUDE.md §7.3), and cpu.stat's usage_usec is a
+// cgroup-wide, monotonic counter that does not depend on which task
+// within it is still alive.
+//
+// Real incident this fixes: a killed activation with substantial real
+// CPU work beforehand (confirmed independently via the live,
+// pre-kill EnergyKillInfo.EnergyConsumedJ) still reported
+// energy_attributed_uj=0 to the collector, because the PID-based final
+// snapshot always failed post-reap — silently, not a rare edge case,
+// unconditional for every kill.
+func readCPUSnapshotFromCgroup(cgroupPath string) CPUSnapshot {
+	snap := CPUSnapshot{WallNs: time.Now().UnixNano()}
+	if cgroupPath == "" {
+		return snap
+	}
+
+	usec, err := readCgroupV2CPUUsec(cgroupPath + "/cpu.stat")
+	if err != nil {
+		log.Printf("readCPUSnapshotFromCgroup path=%s: %v", cgroupPath, err)
+		return snap
+	}
+	snap.ProcessTicks = usec
+	return snap
+}
+
 // attributedEnergyUJ calcule l'énergie attribuée à l'action en µJ.
 //
 // Formule :
@@ -442,7 +511,7 @@ func countAllCores() int {
 // séparée) — le comportement historique, correct partout où rien n'attend
 // synchroniquement que l'écriture soit effective avant de continuer.
 func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta) {
-	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, false)
+	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, false, 0)
 }
 
 // recordMetricsSync est identique à recordMetrics, mais pousse la mesure de
@@ -460,13 +529,35 @@ func (ap *ActionProxy) recordMetrics(endpoint string, start, energyStart int64, 
 // l'événement) sans aucune synchronisation entre eux, donc une vraie
 // fenêtre de course, pas juste une possibilité théorique. recordMetricsSync
 // doit être appelée AVANT le déclenchement de postExecutionKilled(), jamais
-// après (voir runHandler.go, branche killInfo != nil).
+// après (voir runHandler.go, branche killInfo != nil) — ET avant que
+// ap.theExecutor ne soit mis à nil dans cette même branche (voir
+// recordMetricsSyncWithFallback ci-dessous : le calcul final a besoin que
+// l'executor soit encore accessible, pas que le process soit encore vivant).
 func (ap *ActionProxy) recordMetricsSync(endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta) {
-	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, true)
+	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, true, 0)
+}
+
+// recordMetricsSyncWithFallback est identique à recordMetricsSync, avec un
+// filet de sécurité en plus : fallbackJ (CLAUDE.md §6.9, garde-fou de
+// défense en profondeur, PAS le mécanisme principal — voir readCPUSnapshotFromCgroup
+// et l'ordonnancement dans runHandler.go pour le vrai correctif). Si cette
+// activation calcule malgré tout une attribution CPU strictement nulle
+// (attributed == 0) au règlement, ce n'est substitué QUE dans ce cas précis
+// par fallbackJ — une valeur déjà calculée EN DIRECT, avant le kill, par le
+// propre ticker de monitorEnergy() (EnergyKillInfo.EnergyConsumedJ), donc
+// jamais soumise au problème de PID déjà fauché qui affecte le relevé final.
+// N'est appelée que depuis la branche killInfo != nil de runHandler.go —
+// jamais depuis le chemin de complétion normale (fallbackJ vaudrait 0 là,
+// donc n'aurait de toute façon aucun effet, mais ce chemin n'a même pas de
+// valeur de repli à offrir).
+func (ap *ActionProxy) recordMetricsSyncWithFallback(
+	endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta, fallbackJ float64,
+) {
+	ap.recordMetricsImpl(endpoint, start, energyStart, cpuStart, meta, true, fallbackJ)
 }
 
 func (ap *ActionProxy) recordMetricsImpl(
-	endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta, sync bool,
+	endpoint string, start, energyStart int64, cpuStart CPUSnapshot, meta *RunMeta, sync bool, fallbackJ float64,
 ) {
 	energyEnd, err := readEnergy()
 	if err != nil {
@@ -474,14 +565,39 @@ func (ap *ActionProxy) recordMetricsImpl(
 	}
 	end := time.Now().UnixNano()
 
+	// readCPUSnapshotFromCgroup, not readCPUSnapshot(pid): by the time this
+	// runs after a kill, killExecution()'s own internal cmd.Wait() has
+	// already fully reaped the process (cgroupFreezer.go) — /proc/{pid} is
+	// gone, not merely a zombie. The activation's cgroup directory itself
+	// persists independently of that PID (removed later, by
+	// Executor.Stop()/ActivationController.Close()), so reading cpu.stat
+	// via the known cgroup path works whether the process is still running
+	// (normal completion) or already reaped (kill path) — a single,
+	// PID-independent mechanism for both.
 	var cpuEnd CPUSnapshot
 	if ap.theExecutor != nil {
-		cpuEnd = readCPUSnapshot(ap.theExecutor.Pid())
+		cpuEnd = readCPUSnapshotFromCgroup(ap.theExecutor.CgroupPath())
 	}
 	// Corriger le WallNs de fin avec le timestamp déjà lu
 	cpuEnd.WallNs = end
 
 	attributed := attributedEnergyUJ(energyStart, energyEnd, cpuStart, cpuEnd)
+
+	// Defense-in-depth safety net (CLAUDE.md §6.9), not the primary fix:
+	// the ordering (recordMetricsSync called before ap.theExecutor = nil,
+	// runHandler.go) plus readCPUSnapshotFromCgroup above should already
+	// make attributed == 0 mean "genuinely zero CPU work", never "could not
+	// measure". This substitution exists only in case that assumption ever
+	// breaks again (a future regression, or the cgroup already removed by
+	// the time this runs) — real incident this replaces: a killed
+	// activation with substantial real CPU work still silently reported
+	// energy_attributed_uj=0 because the final snapshot's PID had already
+	// been reaped. fallbackJ is 0 (a no-op here) on every call site except
+	// recordMetricsSyncWithFallback's own kill-path caller.
+	if attributed == 0 && fallbackJ > 0 {
+		logEnergyAttributionFallbackUsed(meta, attributed, fallbackJ)
+		attributed = int64(fallbackJ * 1e6)
+	}
 
 	entry := Entry{
 		Start:            start,

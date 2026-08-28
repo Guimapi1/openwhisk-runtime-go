@@ -190,8 +190,6 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 	// runtime -> scheduler channel (schedulerChannel.go), fire-and-forget
 	// — this /run response itself carries none of it (see below).
 	if killInfo != nil {
-		ap.theExecutor = nil // the process is dead; a fresh one is needed next time
-
 		totalConsumedJ := killInfo.EnergyConsumedJ + energyState.ConsumedBeforeJ
 		event := ExecutionKilledEvent{
 			Event:                "EXECUTION_KILLED",
@@ -220,7 +218,20 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		// synchronization between them, a real risk of the scheduler
 		// settling on an incomplete measurement, not a theoretical one.
 		// recordMetricsSync blocks until the push actually completes.
-		ap.recordMetricsSync("/run", start, energyStart, cpuStart, meta)
+		//
+		// MUST run before `ap.theExecutor = nil` below (real incident this
+		// fixes): recordMetricsImpl's own final CPU snapshot needs
+		// ap.theExecutor non-nil to resolve the activation's cgroup path
+		// (readCPUSnapshotFromCgroup, metrics_helpers.go) — nil'ing it out
+		// first silently zeroed that snapshot for every killed activation,
+		// discarding real, substantial CPU work. killInfo.EnergyConsumedJ
+		// (already correctly measured live, before this kill, by
+		// monitorEnergy()'s own ticker) is passed as an explicit
+		// defense-in-depth fallback, used only if this activation's final
+		// attribution still comes out to exactly 0 despite the fix.
+		ap.recordMetricsSyncWithFallback("/run", start, energyStart, cpuStart, meta, killInfo.EnergyConsumedJ)
+
+		ap.theExecutor = nil // the process is dead; a fresh one is needed next time
 
 		// Fire-and-forget over the dedicated channel (CLAUDE.md §3.1: must
 		// never block this response — a synchronous call could stall for
