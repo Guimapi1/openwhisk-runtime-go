@@ -139,27 +139,53 @@ func shortActionName(qualified string) string {
 // declared for it.
 //
 // Defense in depth (CLAUDE.md §3.3, hardening fix): if the resolved
-// name is still empty, or genuinely absent from the map, the default
-// is now to NOT enforce — the reverse of the previous "safe default is
-// enforced" assumption, which had it backwards. A trace that runs
-// unmonitored already has a safe, tested catch-all (committed_j
-// credited uncapped at settlement, a dedicated [safety] log — CLAUDE.md
-// §3.3). A NON_INTERRUPTIBLE action frozen or killed by mistake has no
-// recovery path at all. Between under-enforcing a genuinely
-// interruptible action and destroying a genuinely NON_INTERRUPTIBLE
-// one, the former is the strictly safer failure mode. Should now be
-// rare after the action_name fix above — every occurrence is logged as
-// a critical [safety] incident (logUnresolvedInterruptionClass), not
-// silently absorbed, since it signals the resolution mechanism itself
-// failed, not an expected/accounted-for outcome.
+// name is still EMPTY — this step's own action_name could not be
+// decoded at all, a genuine resolution failure — the default is to NOT
+// enforce, the reverse of the previous "safe default is enforced"
+// assumption, which had it backwards. A trace that runs unmonitored
+// already has a safe, tested catch-all (committed_j credited uncapped
+// at settlement, a dedicated [safety] log — CLAUDE.md §3.3). A
+// NON_INTERRUPTIBLE action frozen or killed by mistake has no recovery
+// path at all. Between under-enforcing a genuinely interruptible action
+// and destroying a genuinely NON_INTERRUPTIBLE one, the former is the
+// strictly safer failure mode. Should now be rare after the
+// action_name fix above — every occurrence is logged as a critical
+// [safety] incident (logUnresolvedInterruptionClass), not silently
+// absorbed, since it signals the resolution mechanism itself failed,
+// not an expected/accounted-for outcome.
+//
+// A resolved (non-empty) name simply ABSENT from the map is NOT the
+// same failure — real incident, PLAYBOOK.md Phase 9's recovery-side
+// pause/extend/resume demonstration: this is the NORMAL, EXPECTED shape
+// for a compensation action (CLAUDE.md §6.3, "interruption_class n'est
+// pas exigée sur une action déclarée uniquement comme cible de
+// compensation_sequence" — core/scheduler.py::_interruption_class_map()
+// deliberately OMITS such an action from the map it sends). Treating
+// this identically to a genuine resolution failure silently disabled
+// shouldMonitorEnergy() (below) for EVERY compensation with a
+// pause_policy — the entire §3.2 "phase recovery — pause et extension
+// désormais applicables" mechanism was inert in production: a
+// compensation could overshoot its threshold by tens of joules with
+// ample real time to spare and never freeze, confirmed live. The two
+// cases are distinguished by ResolvedActionName itself, not by map
+// membership: empty means decoding failed (real error, fail safe);
+// non-empty-but-absent means this specific action legitimately carries
+// no interruption_class (§6.3's own compensation-action exception,
+// enforce normally — its pause_policy, an independent field per §2, is
+// what actually governs freezing here).
 func isNonInterruptibleForThisStep(energy *EnergyState) bool {
 	if energy == nil || energy.InterruptionClass == nil {
 		return false
 	}
-	class, ok := energy.InterruptionClass[energy.ResolvedActionName]
-	if !ok || energy.ResolvedActionName == "" {
+	if energy.ResolvedActionName == "" {
 		logUnresolvedInterruptionClass(energy)
 		return true
+	}
+	class, ok := energy.InterruptionClass[energy.ResolvedActionName]
+	if !ok {
+		// Expected shape for a compensation action (see above) — not a
+		// resolution failure, no critical log, enforce normally.
+		return false
 	}
 	return class == "NON_INTERRUPTIBLE"
 }

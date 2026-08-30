@@ -344,3 +344,77 @@ func TestRunHandler_EnergyMonitor_ActionNameResolution_QualifiedOrMissing_NeverE
 		})
 	}
 }
+
+// 7. Regression test for the real production incident found while
+// demonstrating PLAYBOOK.md Phase 9's recovery-side pause/extend/resume
+// round-trip (CLAUDE.md §3.2, §6.3): a compensation action (release_stock,
+// cancel_fraud_hold, ...) never declares interruption_class by design —
+// core/scheduler.py::_interruption_class_map() deliberately OMITS it from
+// the map sent to the runtime. Before this fix, isNonInterruptibleForThisStep
+// treated a resolved-but-map-absent action name identically to a genuine
+// resolution failure (an empty ResolvedActionName) — silently disabling
+// shouldMonitorEnergy() for EVERY compensation with a pause_policy. A
+// compensation could overshoot its threshold by tens of joules with ample
+// real time to spare and never freeze — confirmed live on a real cluster,
+// not hypothetical. This test asserts the opposite of test 6 above: a
+// resolved name absent from the map (the compensation shape) MUST still
+// be frozen normally, and must NOT emit the critical [safety] log (this
+// is the expected, accounted-for shape, not a failure).
+func TestRunHandler_EnergyMonitor_CompensationActionAbsentFromMap_StillEnforcesPause(t *testing.T) {
+	t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
+	t.Setenv("ENERGY_MONITOR_INTERVAL_MS", "10")
+	fs := newFakeSchedulerServer(t)
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	os.RemoveAll("./action/energy_compensation_absent_from_map")
+	logf, err := ioutil.TempFile("/tmp", "log")
+	require.NoError(t, err)
+	ap := NewActionProxy("./action/energy_compensation_absent_from_map", "", logf, logf)
+
+	script := []byte(sleepThenRespondScriptContent("0.3"))
+	_, err = ap.ExtractAction(&script, "bin")
+	require.NoError(t, err)
+	require.NoError(t, ap.StartLatestAction())
+	defer ap.theExecutor.Stop()
+
+	ts := httptest.NewServer(ap)
+	defer ts.Close()
+
+	// action_name resolves correctly ("release_stock", non-empty) but
+	// energy_interruption_class carries an entry for a DIFFERENT action
+	// only — release_stock itself is absent, exactly as
+	// _interruption_class_map() sends it for a real compensation.
+	requestBody := `{"value": {
+		"energy_trace_id": "trace-compensation-map-absent",
+		"energy_reservation_id": "trace-compensation-map-absent",
+		"energy_execution_phase": "recovery",
+		"energy_execution_threshold_j": 1.0,
+		"energy_consumed_before_j": 1.0,
+		"energy_pause_enabled": true,
+		"energy_pause_mode": "CGROUP_FREEZE",
+		"energy_max_pause_duration_ms": 2000,
+		"energy_max_pause_count": 1,
+		"energy_interruption_class": {"reserve_stock": "COMPENSATABLE"}
+	}, "action_name": "/guest/order/release_stock"}`
+
+	resp, status, err := doPost(ts.URL+"/run", requestBody)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status, "resp=%s", resp)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(resp), &parsed))
+	assert.Equal(t, true, parsed["ok"])
+
+	pausedEvents := fs.getPausedEvents()
+	require.Len(t, pausedEvents, 1,
+		"a compensation action legitimately absent from the interruption class map must still be frozen normally")
+	ev := pausedEvents[0]
+	assert.Equal(t, "recovery", ev.ExecutionPhase)
+
+	logged := logBuf.String()
+	assert.NotContains(t, logged, "INTERRUPTION_CLASS_UNRESOLVED",
+		"a compensation action's own absence from the map is expected, not a resolution failure — no critical log")
+}
