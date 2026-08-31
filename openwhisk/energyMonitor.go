@@ -19,6 +19,7 @@ package openwhisk
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -178,7 +179,11 @@ func isNonInterruptibleForThisStep(energy *EnergyState) bool {
 		return false
 	}
 	if energy.ResolvedActionName == "" {
-		logUnresolvedInterruptionClass(energy)
+		// Genuine resolution failure — "the strictly safer failure mode
+		// is to NOT kill" (header note). The [safety] log for this case
+		// is emitted ONCE, by shouldMonitorEnergy()'s path, not here
+		// (this function is now also called repeatedly from
+		// runPauseCycle()'s re-poll loop, where logging would spam).
 		return true
 	}
 	class, ok := energy.InterruptionClass[energy.ResolvedActionName]
@@ -187,7 +192,65 @@ func isNonInterruptibleForThisStep(energy *EnergyState) bool {
 		// resolution failure, no critical log, enforce normally.
 		return false
 	}
-	return class == "NON_INTERRUPTIBLE"
+	// PLAYBOOK.md Phase 16 (CLAUDE.md §0 decision 18): renamed value.
+	// This step must be FROZEN and EXTENDED like any other class
+	// (shouldMonitorEnergy() no longer skips it) but NEVER killed —
+	// runPauseCycle() refuses every kill path for it.
+	return class == "UNKILLABLE"
+}
+
+// interruptionClassUnresolved: this step carried a per-component
+// interruption-class map but its OWN action name could not be decoded at
+// all — a genuine failure of the resolution mechanism (distinct from a
+// resolved name legitimately absent from the map, the compensation-
+// action case). Fail-safe: shouldMonitorEnergy() then skips enforcement
+// entirely rather than risk killing (pauseEnabled=false) or even
+// freezing an action whose class is unknown.
+func interruptionClassUnresolved(energy *EnergyState) bool {
+	return energy != nil && energy.InterruptionClass != nil && energy.ResolvedActionName == ""
+}
+
+// unkillableRepollInterval reads UNKILLABLE_REPOLL_INTERVAL_MS (default
+// 1000ms): how long an UNKILLABLE step stays frozen between re-POSTing
+// EXECUTION_PAUSED while it waits in the scheduler's priority energy
+// queue for capacity (CLAUDE.md §4.11, PLAYBOOK.md Phase 16). Env read
+// directly, per this repo's convention.
+func unkillableRepollInterval() time.Duration {
+	ms := 1000
+	if v := os.Getenv("UNKILLABLE_REPOLL_INTERVAL_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ms = parsed
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// logSafetyUnkillable emits a structured [safety] incident for an
+// UNKILLABLE step that hit a path which, for any other class, would have
+// ended in a local kill — the kill is refused instead (§3.3, §0 decision
+// 18). `severity` is "critical" for a scheduler command that should
+// never have been sent (KILL_EXECUTION) or a broken invariant
+// (freeze/resume failure), "warning" for a transient channel issue the
+// re-poll loop simply retries through.
+func logSafetyUnkillable(event, severity string, energy *EnergyState, pauseID, detail string) {
+	traceID, reservationID, resolved := "", "", ""
+	if energy != nil {
+		traceID, reservationID, resolved = energy.TraceID, energy.ReservationID, energy.ResolvedActionName
+	}
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":                event,
+		"severity":             severity,
+		"trace_id":             traceID,
+		"reservation_id":       reservationID,
+		"pause_id":             pauseID,
+		"resolved_action_name": resolved,
+		"detail":               detail,
+	})
+	if err != nil {
+		log.Printf("[safety] %s for trace=%s (marshal failed: %v): %s", event, traceID, err, detail)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
 }
 
 // logUnresolvedInterruptionClass emits a critical-severity [safety] log
@@ -207,7 +270,7 @@ func logUnresolvedInterruptionClass(energy *EnergyState) {
 		"interruption_class_map": energy.InterruptionClass,
 		"detail": "this step's own interruption class could not be resolved from " +
 			"InterruptionClass — defaulting to NOT enforcing (fail-safe) rather than " +
-			"risk freezing/killing a NON_INTERRUPTIBLE action by mistake",
+			"risk freezing/killing an UNKILLABLE action by mistake",
 	})
 	if err != nil {
 		log.Printf(
@@ -219,17 +282,29 @@ func logUnresolvedInterruptionClass(energy *EnergyState) {
 	log.Printf("[safety] %s", encoded)
 }
 
-// shouldMonitorEnergy mirrors CLAUDE.md §7.2 and §3.3: a disabled or
-// negative threshold, no energy state at all (§7.5's third case,
-// energy==nil), or THIS step's action being NON_INTERRUPTIBLE all mean
-// no threshold ENFORCEMENT loop — i.e. no freeze, no kill (§3.3:
-// "aucun freeze énergétique, aucun kill énergétique"). Measurement
-// itself is unaffected: runHandler.go's start/end readEnergy snapshots
-// (§3.3's "mesure continue") run unconditionally, independent of this
-// monitoring loop, so a NON_INTERRUPTIBLE step is still fully measured
-// and reinjected into __energy_state even with no monitor goroutine.
+// shouldMonitorEnergy mirrors CLAUDE.md §7.2: a disabled/negative
+// threshold or no energy state at all (§7.5's third case) means no
+// threshold ENFORCEMENT loop. Measurement itself is unaffected either
+// way — runHandler.go's start/end readEnergy snapshots run
+// unconditionally.
+//
+// PLAYBOOK.md Phase 16 (CLAUDE.md §0 decision 18, §3.3): an UNKILLABLE
+// step is NO LONGER excluded here — it is monitored, frozen and extended
+// like any other class; only the KILL paths in runPauseCycle() are
+// refused for it. The ONE remaining reason to skip enforcement on a
+// class basis is an UNRESOLVED interruption class (the step's own action
+// name couldn't be decoded): a genuine resolution failure, fail-safe to
+// NOT enforce (could be a real UNKILLABLE we'd wrongly freeze/kill).
+// That case is logged once, here.
 func shouldMonitorEnergy(energy *EnergyState) bool {
-	return energy != nil && energy.ExecutionThresholdJ > 0 && !isNonInterruptibleForThisStep(energy)
+	if energy == nil || energy.ExecutionThresholdJ <= 0 {
+		return false
+	}
+	if interruptionClassUnresolved(energy) {
+		logUnresolvedInterruptionClass(energy)
+		return false
+	}
+	return true
 }
 
 // monitorEnergy periodically measures the energy attributed to proc's
@@ -289,6 +364,22 @@ func (proc *Executor) monitorEnergy(
 			}
 
 			if !energy.PauseEnabled {
+				if isNonInterruptibleForThisStep(&energy) {
+					// PLAYBOOK.md Phase 16 (CLAUDE.md §3.3, §3.4): an
+					// UNKILLABLE action ALWAYS has a mandatory pause_policy
+					// (registry-enforced), so pauseEnabled=false here can
+					// only mean this step's class is UNRESOLVED and the
+					// fail-safe treats it as UNKILLABLE. Refuse the local
+					// kill; let it run unmonitored (the scheduler's own
+					// settlement catch-all, §3.3, still accounts for it).
+					logSafetyUnkillable(
+						"LOCAL_KILL_REFUSED_UNKILLABLE", "critical", &energy, "",
+						"threshold reached with pauseEnabled=false for a step "+
+							"resolved locally as UNKILLABLE (or unresolvable) — "+
+							"local kill REFUSED, action NOT killed, monitoring stops",
+					)
+					return
+				}
 				log.Printf(
 					"[energy_monitor] threshold reached for trace=%s: consumed_before=%.4fJ + "+
 						"step=%.4fJ >= threshold=%.4fJ — killing locally, synchronously "+
@@ -328,9 +419,27 @@ func (proc *Executor) runPauseCycle(
 	energy *EnergyState, actionName string, stepJ float64,
 ) (newThresholdJ float64, killed bool, pauseID string) {
 	pauseID = newPauseID()
+	// PLAYBOOK.md Phase 16 (CLAUDE.md §0 decision 18, §3.3): resolved
+	// ONCE per cycle. For an UNKILLABLE step, EVERY path that would
+	// otherwise end in a local kill (freeze failure, channel failure,
+	// stale/mismatched command, resume failure, an explicit
+	// KILL_EXECUTION command, an unknown command) instead logs a
+	// [safety] incident, keeps the process frozen, and re-POSTs
+	// EXECUTION_PAUSED after a backoff — the trace can only ever leave
+	// this cycle via a genuine RESUME_EXECUTION.
+	unkillable := isNonInterruptibleForThisStep(energy)
 	requestedAt := time.Now()
 
 	if err := proc.controller.freezeExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
+		if unkillable {
+			logSafetyUnkillable(
+				"FREEZE_FAILED_UNKILLABLE", "critical", energy, pauseID,
+				fmt.Sprintf("freezeExecution failed (%v) — cannot kill an UNKILLABLE "+
+					"step (§3.3); continuing best-effort with the current threshold, "+
+					"this trace's budget may be exceeded", err),
+			)
+			return energy.ExecutionThresholdJ, false, pauseID
+		}
 		log.Printf(
 			"[safety] freezeExecution failed for trace=%s pause=%s: %v — killing "+
 				"(cannot safely continue monitoring an unfrozen, over-threshold process).",
@@ -361,64 +470,108 @@ func (proc *Executor) runPauseCycle(
 		energy.TraceID, pauseID, event.EnergyConsumedJ, freezeLatencyMs,
 	)
 
-	command, err := postExecutionPaused(event, energy.MaxPauseDurationMs)
-	if err != nil {
-		log.Printf(
-			"[safety] EXECUTION_PAUSED channel call failed for trace=%s pause=%s: %v — "+
-				"killing (cannot resume without a confirmed scheduler command).",
-			energy.TraceID, pauseID, err,
-		)
+	// killOrRetry is the single choke point for every "cannot safely
+	// continue" branch below: kill for any normal class, re-poll (never
+	// kill) for UNKILLABLE. Returns true when the caller should `return`
+	// a kill, false when it should re-loop.
+	killOrRetry := func(event, severity, detail string) (float64, bool, string, bool) {
+		if unkillable {
+			logSafetyUnkillable(event, severity, energy, pauseID, detail+
+				" — UNKILLABLE step, NOT killed; staying frozen, re-polling")
+			time.Sleep(unkillableRepollInterval())
+			return 0, false, pauseID, true // retry
+		}
+		log.Printf("[safety] %s for trace=%s pause=%s — killing (%s).", event, energy.TraceID, pauseID, detail)
 		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
 			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
 		}
-		return 0, true, pauseID
+		return 0, true, pauseID, false // kill, do not retry
 	}
 
-	if command.PauseID != pauseID {
-		// CLAUDE.md §6.6: "Une commande avec un pause_id obsolète est
-		// ignorée et loggée" — here that can only mean the scheduler's
-		// answer does not correspond to the pause cycle we just opened;
-		// there is no cycle left to resume into, so the safe response is
-		// the same as an unreachable scheduler: kill.
-		log.Printf(
-			"[safety] scheduler command pause_id=%q does not match the active pause=%q "+
-				"for trace=%s — stale/mismatched command, ignoring it and killing.",
-			command.PauseID, pauseID, energy.TraceID,
-		)
-		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
-			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
+	for {
+		command, err := postExecutionPaused(event, energy.MaxPauseDurationMs)
+		if err != nil {
+			if nt, k, pid, retry := killOrRetry("PAUSE_CHANNEL_FAILED", "warning",
+				fmt.Sprintf("EXECUTION_PAUSED channel call failed: %v", err)); !retry {
+				return nt, k, pid
+			}
+			continue
 		}
-		return 0, true, pauseID
-	}
 
-	switch command.Command {
-	case "RESUME_EXECUTION":
-		if err := proc.controller.resumeExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
-			log.Printf("[safety] resumeExecution failed for trace=%s pause=%s: %v — killing.", energy.TraceID, pauseID, err)
-			if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
-				log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
+		if command.PauseID != pauseID {
+			// CLAUDE.md §6.6: a stale/mismatched pause_id is ignored and
+			// logged. For a normal class there is no cycle left to
+			// resume into -> kill; for UNKILLABLE -> re-poll.
+			if nt, k, pid, retry := killOrRetry("PAUSE_ID_MISMATCH", "warning",
+				fmt.Sprintf("scheduler command pause_id=%q does not match active pause=%q", command.PauseID, pauseID)); !retry {
+				return nt, k, pid
+			}
+			continue
+		}
+
+		switch command.Command {
+		case "RESUME_EXECUTION":
+			if err := proc.controller.resumeExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
+				if nt, k, pid, retry := killOrRetry("RESUME_FAILED", "critical",
+					fmt.Sprintf("resumeExecution failed: %v", err)); !retry {
+					return nt, k, pid
+				}
+				continue
+			}
+			log.Printf(
+				"[resume] trace=%s pause=%s resumed, new_threshold=%.4fJ",
+				energy.TraceID, pauseID, command.NewExecutionThresholdJ,
+			)
+			return command.NewExecutionThresholdJ, false, pauseID
+
+		case "WAIT_EXECUTION":
+			// PLAYBOOK.md Phase 16 (CLAUDE.md §4.11): the scheduler has
+			// queued this UNKILLABLE step's extension request in the
+			// priority energy wait queue. Stay frozen, re-ask.
+			if !unkillable {
+				if nt, k, pid, retry := killOrRetry("UNEXPECTED_WAIT_COMMAND", "critical",
+					"WAIT_EXECUTION is only valid for an UNKILLABLE step"); !retry {
+					return nt, k, pid
+				}
+				continue
+			}
+			log.Printf(
+				"[pause] WAIT_EXECUTION trace=%s pause=%s reason=%s — UNKILLABLE awaiting "+
+					"capacity (§4.11), staying frozen, re-polling in %s.",
+				energy.TraceID, pauseID, command.Reason, unkillableRepollInterval(),
+			)
+			time.Sleep(unkillableRepollInterval())
+			continue
+
+		case "KILL_EXECUTION":
+			if unkillable {
+				// Defense in depth (PLAYBOOK.md Phase 16 objective 3):
+				// the scheduler must NEVER send this for an UNKILLABLE
+				// step, but if one arrives, do not trust it blindly —
+				// refuse, log a critical [safety] incident, keep frozen
+				// and re-poll. Mirrors this repo's own caution around
+				// action-name resolution.
+				logSafetyUnkillable(
+					"KILL_EXECUTION_REFUSED_UNKILLABLE", "critical", energy, pauseID,
+					fmt.Sprintf("scheduler sent KILL_EXECUTION (reason=%q) for a step "+
+						"resolved locally as UNKILLABLE — command IGNORED, action NOT "+
+						"killed (§3.3, §0 decision 18); staying frozen, re-polling", command.Reason),
+				)
+				time.Sleep(unkillableRepollInterval())
+				continue
+			}
+			log.Printf("[energy_monitor] KILL_EXECUTION received for trace=%s pause=%s reason=%s", energy.TraceID, pauseID, command.Reason)
+			if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
+				log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, err)
 			}
 			return 0, true, pauseID
+
+		default:
+			if nt, k, pid, retry := killOrRetry("UNKNOWN_SCHEDULER_COMMAND", "warning",
+				fmt.Sprintf("unknown scheduler command %q", command.Command)); !retry {
+				return nt, k, pid
+			}
+			continue
 		}
-		log.Printf(
-			"[resume] trace=%s pause=%s resumed, new_threshold=%.4fJ",
-			energy.TraceID, pauseID, command.NewExecutionThresholdJ,
-		)
-		return command.NewExecutionThresholdJ, false, pauseID
-	case "KILL_EXECUTION":
-		log.Printf("[energy_monitor] KILL_EXECUTION received for trace=%s pause=%s reason=%s", energy.TraceID, pauseID, command.Reason)
-		if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
-			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, err)
-		}
-		return 0, true, pauseID
-	default:
-		log.Printf(
-			"[safety] unknown scheduler command %q for trace=%s pause=%s — killing.",
-			command.Command, energy.TraceID, pauseID,
-		)
-		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
-			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
-		}
-		return 0, true, pauseID
 	}
 }

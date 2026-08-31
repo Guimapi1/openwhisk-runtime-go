@@ -17,20 +17,19 @@
 
 package openwhisk
 
-// nonInterruptible_test.go: PLAYBOOK.md Phase 10, CLAUDE.md §3.3. Unlike
-// KILL_SAFE/COMPENSATABLE (executor_test.go, pauseResume_test.go), a
-// NON_INTERRUPTIBLE step must receive NEITHER a freeze NOR a kill no
-// matter how far past its threshold it runs — enforcement is entirely
-// disabled for this class, measurement is not (§7.9's "mesure continue"
-// is delivered by runHandler.go's unconditional start/end readEnergy
-// snapshots, independent of shouldMonitorEnergy's loop).
+// nonInterruptible_test.go: PLAYBOOK.md Phase 10 → 16, CLAUDE.md §0
+// decision 18, §3.3. NON_INTERRUPTIBLE became UNKILLABLE: it is now
+// FROZEN and EXTENDED at its threshold exactly like any other class
+// (shouldMonitorEnergy no longer skips it) — what stays absolutely
+// forbidden is a KILL. runPauseCycle() refuses every path that would
+// otherwise kill an UNKILLABLE step (an explicit KILL_EXECUTION command
+// included — defense in depth), staying frozen and re-polling until it
+// gets a genuine RESUME_EXECUTION.
 //
-// Both fixtures below set energy_consumed_before_j already at/above
-// energy_execution_threshold_j (the same determinism trick as
-// executor_test.go's header comment) specifically so that, had
-// enforcement NOT been disabled, the very first monitor tick would have
-// triggered a freeze or a kill — making "nothing happened" a meaningful,
-// non-vacuous assertion.
+// Fixtures set energy_consumed_before_j already at/above
+// energy_execution_threshold_j (determinism trick, see executor_test.go)
+// so the very first monitor tick reaches the threshold — making "was
+// frozen" / "was never killed" meaningful, non-vacuous assertions.
 
 import (
 	"bytes"
@@ -49,34 +48,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 1. A NON_INTERRUPTIBLE action that exceeds its reservation is neither
-// frozen (pause_enabled=true, so a freeze would otherwise be attempted)
-// nor killed — it runs to natural termination.
-func TestRunHandler_EnergyMonitor_NonInterruptible_NeverFreezesOrKills(t *testing.T) {
+// 1. PLAYBOOK Phase 16 (rewrites _NeverFreezesOrKills): an UNKILLABLE
+// action that reaches its threshold IS frozen — an EXECUTION_PAUSED goes
+// out — the scheduler grants RESUME_EXECUTION, and it runs to natural
+// termination. It is NEVER killed.
+func TestRunHandler_EnergyMonitor_Unkillable_FrozenThenResumed_NeverKilled(t *testing.T) {
 	t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
 	t.Setenv("ENERGY_MONITOR_INTERVAL_MS", "10")
 	fs := newFakeSchedulerServer(t)
-	// If the runtime ever tried to freeze this step, the fake scheduler
-	// would grant a resume — which would make a bug (enforcement wrongly
-	// applied) look like a passing test instead of a hang. Asserting
-	// zero paused/killed events below is what actually catches it.
-	fs.setCommandFunc(func(ev ExecutionPausedEvent) SchedulerCommand {
-		return SchedulerCommand{
-			Command: "RESUME_EXECUTION", TraceID: ev.TraceID,
-			ReservationID: ev.ReservationID, PauseID: ev.PauseID,
-			NewExecutionThresholdJ: 1e9,
-		}
-	})
+	// Default commandFunc already grants RESUME with a huge threshold —
+	// exactly what a normal, successful extension looks like.
 
-	os.RemoveAll("./action/energy_noninterruptible")
+	os.RemoveAll("./action/energy_unkillable")
 	logf, err := ioutil.TempFile("/tmp", "log")
 	require.NoError(t, err)
-	ap := NewActionProxy("./action/energy_noninterruptible", "", logf, logf)
+	ap := NewActionProxy("./action/energy_unkillable", "", logf, logf)
 
-	// Sleeps briefly (long enough for several monitor ticks to have a
-	// chance to fire, at ENERGY_MONITOR_INTERVAL_MS=10) then responds
-	// normally — if enforcement were wrongly active, this process would
-	// never get the chance to reach its own response.
 	script := []byte(sleepThenRespondScriptContent("0.3"))
 	_, err = ap.ExtractAction(&script, "bin")
 	require.NoError(t, err)
@@ -87,8 +74,8 @@ func TestRunHandler_EnergyMonitor_NonInterruptible_NeverFreezesOrKills(t *testin
 	defer ts.Close()
 
 	requestBody := `{"value": {
-		"energy_trace_id": "trace-noninterruptible",
-		"energy_reservation_id": "trace-noninterruptible",
+		"energy_trace_id": "trace-unkillable",
+		"energy_reservation_id": "trace-unkillable",
 		"energy_execution_phase": "forward",
 		"energy_execution_threshold_j": 1.0,
 		"energy_consumed_before_j": 1.0,
@@ -96,7 +83,7 @@ func TestRunHandler_EnergyMonitor_NonInterruptible_NeverFreezesOrKills(t *testin
 		"energy_pause_mode": "CGROUP_FREEZE",
 		"energy_max_pause_duration_ms": 2000,
 		"energy_max_pause_count": 1,
-		"energy_interruption_class": {"long_running_step": "NON_INTERRUPTIBLE"}
+		"energy_interruption_class": {"long_running_step": "UNKILLABLE"}
 	}, "action_name": "long_running_step"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
@@ -107,11 +94,9 @@ func TestRunHandler_EnergyMonitor_NonInterruptible_NeverFreezesOrKills(t *testin
 	require.NoError(t, json.Unmarshal([]byte(resp), &parsed))
 	assert.Equal(t, true, parsed["ok"], "the action must reach its own natural termination: %s", resp)
 
-	// Give any wrongly-fired async event a moment to land before
-	// asserting its absence.
 	time.Sleep(50 * time.Millisecond)
-	assert.Empty(t, fs.getPausedEvents(), "a NON_INTERRUPTIBLE step must never be frozen (§3.3)")
-	assert.Empty(t, fs.getKilledEvents(), "a NON_INTERRUPTIBLE step must never be killed (§3.3)")
+	assert.NotEmpty(t, fs.getPausedEvents(), "an UNKILLABLE step IS frozen at its threshold now (Phase 16)")
+	assert.Empty(t, fs.getKilledEvents(), "an UNKILLABLE step must never be killed (§3.3)")
 
 	// Still measured (§3.3 "mesure continue", §7.9): __energy_state
 	// carries an up-to-date consumed_before_j despite no enforcement.
@@ -124,18 +109,13 @@ func TestRunHandler_EnergyMonitor_NonInterruptible_NeverFreezesOrKills(t *testin
 	assert.True(t, consumedBefore >= 1.0, "measurement must still have happened: %v", consumedBefore)
 }
 
-// 5. In a two-step sequence (KILL_SAFE then NON_INTERRUPTIBLE, sharing
-// one per-component interruption_class map, PLAYBOOK.md Phase 10), only
-// the NON_INTERRUPTIBLE step escapes enforcement — the KILL_SAFE step
-// remains subject to immediate kill on exceeding its own threshold. Each
-// step is simulated as its own action-container process (as it would be
-// in a real native OpenWhisk sequence), distinguished purely by the
-// /run payload's own "action_name" field (docs/ACTION.md — a real
-// per-activation field OpenWhisk always sends, unlike __OW_ACTION_NAME,
-// which this process never sets for itself), resolving its OWN entry
-// in the shared map — never a registry lookup (§7.1).
-func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesEnforcement(t *testing.T) {
-	sharedInterruptionClass := `{"step_kill_safe": "KILL_SAFE", "step_non_interruptible": "NON_INTERRUPTIBLE"}`
+// 5. In a two-step sequence (KILL_SAFE then UNKILLABLE, sharing one
+// per-component interruption_class map), each step resolves its OWN
+// entry from the /run payload's "action_name" field. PLAYBOOK Phase 16:
+// the KILL_SAFE step is still killed on overrun; the UNKILLABLE step is
+// FROZEN and RESUMED (never killed).
+func TestRunHandler_EnergyMonitor_MixedSequence_KillSafeKilled_UnkillableFrozenNotKilled(t *testing.T) {
+	sharedInterruptionClass := `{"step_kill_safe": "KILL_SAFE", "step_unkillable": "UNKILLABLE"}`
 
 	t.Run("first step: KILL_SAFE remains enforced", func(t *testing.T) {
 		t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
@@ -180,15 +160,15 @@ func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesE
 		assert.Equal(t, "trace-mixed-seq", fs.getKilledEvents()[0].TraceID)
 	})
 
-	t.Run("second step: NON_INTERRUPTIBLE escapes enforcement", func(t *testing.T) {
+	t.Run("second step: UNKILLABLE is frozen and resumed, never killed", func(t *testing.T) {
 		t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
 		t.Setenv("ENERGY_MONITOR_INTERVAL_MS", "10")
-		fs := newFakeSchedulerServer(t)
+		fs := newFakeSchedulerServer(t) // default commandFunc grants RESUME
 
-		os.RemoveAll("./action/energy_mixed_seq_non_interruptible")
+		os.RemoveAll("./action/energy_mixed_seq_unkillable")
 		logf, err := ioutil.TempFile("/tmp", "log")
 		require.NoError(t, err)
-		ap := NewActionProxy("./action/energy_mixed_seq_non_interruptible", "", logf, logf)
+		ap := NewActionProxy("./action/energy_mixed_seq_unkillable", "", logf, logf)
 
 		script := []byte(sleepThenRespondScriptContent("0.3"))
 		_, err = ap.ExtractAction(&script, "bin")
@@ -199,10 +179,10 @@ func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesE
 		ts := httptest.NewServer(ap)
 		defer ts.Close()
 
-		// Same shared map, same threshold/consumed_before shape as the
-		// KILL_SAFE step above — only the request's own "action_name"
-		// field differs, proving the runtime resolves ITS OWN entry
-		// rather than e.g. always picking the first (or only) map entry.
+		// Same shared map, same threshold/consumed_before shape — only
+		// the request's own "action_name" differs, proving the runtime
+		// resolves ITS OWN entry. pause_enabled=true (UNKILLABLE's
+		// pause_policy is mandatory now, §3.4).
 		requestBody := `{"value": {
 			"__energy_state": {
 				"trace_id": "trace-mixed-seq",
@@ -210,13 +190,13 @@ func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesE
 				"execution_phase": "forward",
 				"execution_threshold_j": 1.0,
 				"consumed_before_j": 1.0,
-				"pause_enabled": false,
-				"pause_mode": "",
-				"max_pause_duration_ms": 0,
-				"max_pause_count": 0,
+				"pause_enabled": true,
+				"pause_mode": "CGROUP_FREEZE",
+				"max_pause_duration_ms": 2000,
+				"max_pause_count": 1,
 				"interruption_class": ` + sharedInterruptionClass + `
 			}
-		}, "action_name": "step_non_interruptible"}`
+		}, "action_name": "step_unkillable"}`
 
 		resp, status, err := doPost(ts.URL+"/run", requestBody)
 		require.NoError(t, err)
@@ -227,8 +207,8 @@ func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesE
 		assert.Equal(t, true, parsed["ok"])
 
 		time.Sleep(50 * time.Millisecond)
-		assert.Empty(t, fs.getKilledEvents(), "the NON_INTERRUPTIBLE step must not be killed")
-		assert.Empty(t, fs.getPausedEvents(), "the NON_INTERRUPTIBLE step must not be frozen")
+		assert.Empty(t, fs.getKilledEvents(), "the UNKILLABLE step must never be killed")
+		assert.NotEmpty(t, fs.getPausedEvents(), "the UNKILLABLE step IS frozen at its threshold now")
 	})
 }
 
@@ -251,28 +231,28 @@ func TestRunHandler_EnergyMonitor_MixedSequence_OnlyNonInterruptibleStepEscapesE
 // (uncapped committed_j at settlement); a NON_INTERRUPTIBLE action
 // frozen/killed by mistake has none.
 //
-// Both cases below are real, not hypothetical: a qualified action_name
-// (what OpenWhisk actually sends) and a missing action_name (what this
-// proxy's own environment always produced pre-fix, via
-// __OW_ACTION_NAME). Both must leave the step unfrozen and unkilled;
-// only the missing-name case should still be genuinely UNRESOLVED
-// after the fix (the qualified name normalizes and resolves correctly)
-// — so only that case must emit the new critical [safety] log.
-func TestRunHandler_EnergyMonitor_ActionNameResolution_QualifiedOrMissing_NeverEnforcesNonInterruptible(t *testing.T) {
+// PLAYBOOK Phase 16 update: a CORRECTLY resolved UNKILLABLE name is now
+// FROZEN (monitored like any class) — only the genuinely UNRESOLVED case
+// still skips enforcement (fail-safe) and emits the critical [safety]
+// log. Neither case is ever KILLED.
+func TestRunHandler_EnergyMonitor_ActionNameResolution_QualifiedResolvesAndFreezes_MissingFailsSafe(t *testing.T) {
 	cases := []struct {
 		name            string
 		actionNameField string // "" = field omitted from the request body entirely
-		expectSafetyLog bool   // whether resolution should still fail even after the fix
+		expectSafetyLog bool   // resolution genuinely failed (unresolved) -> fail-safe, log
+		expectFrozen    bool   // resolved UNKILLABLE -> monitored -> frozen at threshold
 	}{
 		{
-			name:            "qualified action_name resolves correctly via normalization",
-			actionNameField: `, "action_name": "/guest/order/step_non_interruptible"`,
+			name:            "qualified action_name resolves -> UNKILLABLE step is frozen",
+			actionNameField: `, "action_name": "/guest/order/step_unkillable"`,
 			expectSafetyLog: false,
+			expectFrozen:    true,
 		},
 		{
-			name:            "missing action_name stays unresolved, fails safe, logs critical",
+			name:            "missing action_name stays unresolved -> fails safe, logs critical, not frozen",
 			actionNameField: "",
 			expectSafetyLog: true,
+			expectFrozen:    false,
 		},
 	}
 
@@ -313,7 +293,7 @@ func TestRunHandler_EnergyMonitor_ActionNameResolution_QualifiedOrMissing_NeverE
 				"energy_pause_mode": "CGROUP_FREEZE",
 				"energy_max_pause_duration_ms": 2000,
 				"energy_max_pause_count": 1,
-				"energy_interruption_class": {"step_non_interruptible": "NON_INTERRUPTIBLE"}
+				"energy_interruption_class": {"step_unkillable": "UNKILLABLE"}
 			}%s}`, tc.actionNameField)
 
 			resp, status, err := doPost(ts.URL+"/run", requestBody)
@@ -325,8 +305,12 @@ func TestRunHandler_EnergyMonitor_ActionNameResolution_QualifiedOrMissing_NeverE
 			assert.Equal(t, true, parsed["ok"], "the action must reach its own natural termination: %s", resp)
 
 			time.Sleep(50 * time.Millisecond)
-			assert.Empty(t, fs.getPausedEvents(), "must never be frozen regardless of resolution outcome (§3.3)")
-			assert.Empty(t, fs.getKilledEvents(), "must never be killed regardless of resolution outcome (§3.3)")
+			if tc.expectFrozen {
+				assert.NotEmpty(t, fs.getPausedEvents(), "a resolved UNKILLABLE step is frozen at threshold (Phase 16)")
+			} else {
+				assert.Empty(t, fs.getPausedEvents(), "an unresolved class fails safe: no enforcement, no freeze")
+			}
+			assert.Empty(t, fs.getKilledEvents(), "never killed regardless of resolution outcome (§3.3)")
 
 			logged := logBuf.String()
 			if tc.expectSafetyLog {
@@ -417,4 +401,98 @@ func TestRunHandler_EnergyMonitor_CompensationActionAbsentFromMap_StillEnforcesP
 	logged := logBuf.String()
 	assert.NotContains(t, logged, "INTERRUPTION_CLASS_UNRESOLVED",
 		"a compensation action's own absence from the map is expected, not a resolution failure — no critical log")
+}
+
+// 8. PLAYBOOK Phase 16 objective 3 / required test #4 — DEFENSE IN
+// DEPTH. The scheduler must NEVER send KILL_EXECUTION for an UNKILLABLE
+// step; if one arrives anyway (simulated here), the runtime REFUSES it:
+// a critical [safety] incident (KILL_EXECUTION_REFUSED_UNKILLABLE), the
+// process is NOT killed, it stays frozen and re-polls. The scheduler
+// then answers RESUME on the re-poll so the action completes.
+func TestRunHandler_EnergyMonitor_Unkillable_RefusesKillExecutionCommand(t *testing.T) {
+	t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
+	t.Setenv("ENERGY_MONITOR_INTERVAL_MS", "10")
+	t.Setenv("UNKILLABLE_REPOLL_INTERVAL_MS", "20") // fast re-poll for the test
+
+	fs := newFakeSchedulerServer(t)
+	var calls int
+	fs.setCommandFunc(func(ev ExecutionPausedEvent) SchedulerCommand {
+		calls++
+		if calls == 1 {
+			// The command that must be refused.
+			return SchedulerCommand{
+				Command: "KILL_EXECUTION", TraceID: ev.TraceID,
+				ReservationID: ev.ReservationID, PauseID: ev.PauseID,
+				Reason: "SHOULD_NEVER_HAPPEN_FOR_UNKILLABLE",
+			}
+		}
+		// The re-poll gets a genuine resume, so the action can finish.
+		return SchedulerCommand{
+			Command: "RESUME_EXECUTION", TraceID: ev.TraceID,
+			ReservationID: ev.ReservationID, PauseID: ev.PauseID,
+			NewExecutionThresholdJ: 1e9,
+		}
+	})
+
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(os.Stderr)
+
+	os.RemoveAll("./action/energy_unkillable_refuse_kill")
+	logf, err := ioutil.TempFile("/tmp", "log")
+	require.NoError(t, err)
+	ap := NewActionProxy("./action/energy_unkillable_refuse_kill", "", logf, logf)
+
+	script := []byte(sleepThenRespondScriptContent("0.4"))
+	_, err = ap.ExtractAction(&script, "bin")
+	require.NoError(t, err)
+	require.NoError(t, ap.StartLatestAction())
+	defer ap.theExecutor.Stop()
+
+	ts := httptest.NewServer(ap)
+	defer ts.Close()
+
+	requestBody := `{"value": {
+		"energy_trace_id": "trace-unkillable-refuse-kill",
+		"energy_reservation_id": "trace-unkillable-refuse-kill",
+		"energy_execution_phase": "forward",
+		"energy_execution_threshold_j": 1.0,
+		"energy_consumed_before_j": 1.0,
+		"energy_pause_enabled": true,
+		"energy_pause_mode": "CGROUP_FREEZE",
+		"energy_max_pause_duration_ms": 2000,
+		"energy_max_pause_count": 1,
+		"energy_interruption_class": {"long_running_step": "UNKILLABLE"}
+	}, "action_name": "long_running_step"}`
+
+	resp, status, err := doPost(ts.URL+"/run", requestBody)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status, "resp=%s", resp)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(resp), &parsed))
+	assert.Equal(t, true, parsed["ok"], "the action must NOT be killed — it completes: %s", resp)
+
+	time.Sleep(50 * time.Millisecond)
+	assert.Empty(t, fs.getKilledEvents(),
+		"KILL_EXECUTION for an UNKILLABLE step must be refused — no EXECUTION_KILLED ever sent")
+	assert.True(t, len(fs.getPausedEvents()) >= 2,
+		"the runtime must re-poll after refusing the kill (initial pause + at least one re-poll)")
+
+	logged := logBuf.String()
+	require.Contains(t, logged, "[safety] ", "the refusal must be a [safety] incident")
+	// Find the [safety] line that carries the refusal event and decode it.
+	var refusal map[string]interface{}
+	for _, line := range strings.Split(logged, "\n") {
+		i := strings.Index(line, "[safety] ")
+		if i < 0 || !strings.Contains(line, "KILL_EXECUTION_REFUSED_UNKILLABLE") {
+			continue
+		}
+		require.NoError(t, json.Unmarshal([]byte(line[i+len("[safety] "):]), &refusal))
+		break
+	}
+	require.NotNil(t, refusal, "a KILL_EXECUTION_REFUSED_UNKILLABLE [safety] line must be present")
+	assert.Equal(t, "KILL_EXECUTION_REFUSED_UNKILLABLE", refusal["event"])
+	assert.Equal(t, "critical", refusal["severity"])
+	assert.Equal(t, "trace-unkillable-refuse-kill", refusal["trace_id"])
 }
