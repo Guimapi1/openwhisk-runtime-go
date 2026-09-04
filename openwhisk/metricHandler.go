@@ -10,6 +10,14 @@ type RunMeta struct {
 	TraceID      string
 	PodName      string
 	ActivationID string
+	// ExecutionPhase is "forward" or "recovery" (CLAUDE.md §0 decision 23,
+	// §6.10). It is NOT a new concept: it is EnergyState.ExecutionPhase,
+	// already carried per-step by the __energy_state sidecar (§7.8) and by
+	// every runtime event (§7.6), merely propagated one step further so
+	// the collector can tag the measurement point with it. Empty when this
+	// invocation carries no energy state at all (an unmanaged action) —
+	// the collector defaults that to "forward".
+	ExecutionPhase string
 }
 
 // Entry représente une mesure complète pour une invocation.
@@ -25,6 +33,15 @@ type Entry struct {
 	TraceID          string `json:"energy_trace_id"`
 	PodName          string `json:"pod_name"`
 	ActivationID     string `json:"activation_id"`
+	// ExecutionPhase discriminates a forward invocation from a compensation
+	// one (CLAUDE.md §0 decision 23, §6.10). The collector writes it as an
+	// indexed TAG so get_energy_reference() can exclude recovery samples
+	// from a sequence's energy reference — while get_energy_for_trace(),
+	// the settlement path, keeps summing both (§4.1/§4.6: compensation
+	// energy stays committed to the slot, it is only excluded from the
+	// statistical reference). omitempty: an unmanaged action sends no
+	// phase at all rather than an empty string.
+	ExecutionPhase   string `json:"execution_phase,omitempty"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.

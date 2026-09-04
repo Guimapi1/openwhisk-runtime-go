@@ -169,6 +169,15 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 				// instead of being pushed to the collector untagged.
 				meta.TraceID = energyState.TraceID
 			}
+			// D4 (CLAUDE.md §0 decision 23, §6.10): carry the phase to the
+			// measurement point, for exactly the same reason TraceID is
+			// carried above — the collector tags the point with it so a
+			// compensation's energy can be excluded from the SEQUENCE's
+			// energy reference (never from its settlement). Read from the
+			// SAME decoded energyState on every step, first or not, so a
+			// later step of a compensation sequence is tagged "recovery"
+			// too and not silently counted as forward.
+			meta.ExecutionPhase = energyState.ExecutionPhase
 			if newBody, marshalErr := json.Marshal(req); marshalErr == nil {
 				body = newBody
 			} else {

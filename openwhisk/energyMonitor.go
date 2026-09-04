@@ -92,6 +92,19 @@ type energyMonitorResult struct {
 	killed    bool
 	consumedJ float64
 	pauseID   string
+
+	// D1 (real-cluster smoke test, CLAUDE.md §7.8 point 2): the LAST
+	// threshold this step actually ran under, i.e. after every extension
+	// granted during its pause cycles. monitorEnergy() keeps a private,
+	// mutable COPY of the EnergyState precisely so a mid-flight pause
+	// cycle never mutates the caller's struct — but ReinjectEnergyState()
+	// serialises the CALLER's struct, so without publishing the settled
+	// value back here, the next sequence step inherited the PRE-extension
+	// threshold. Carried through this result (already the monitor's only
+	// sanctioned channel back to Interact) rather than by widening the
+	// mutation window on the shared struct.
+	thresholdJ       float64
+	thresholdUpdated bool
 }
 
 func (r *energyMonitorResult) setKilled(consumedJ float64, pauseID string) {
@@ -100,6 +113,23 @@ func (r *energyMonitorResult) setKilled(consumedJ float64, pauseID string) {
 	r.killed = true
 	r.consumedJ = consumedJ
 	r.pauseID = pauseID
+}
+
+// setThreshold records the threshold this step is now running under,
+// after a successful (possibly partial) extension. Called once per
+// resumed pause cycle; the last call wins, which is exactly the value
+// the next step must inherit (D1).
+func (r *energyMonitorResult) setThreshold(thresholdJ float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.thresholdJ = thresholdJ
+	r.thresholdUpdated = true
+}
+
+func (r *energyMonitorResult) finalThreshold() (float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.thresholdJ, r.thresholdUpdated
 }
 
 func (r *energyMonitorResult) get() (bool, float64, string) {
@@ -399,6 +429,11 @@ func (proc *Executor) monitorEnergy(
 				return
 			}
 			energy.ExecutionThresholdJ = newThresholdJ
+			// D1 (§7.8 point 2): publish the post-extension threshold so
+			// Interact() can hand it back to the caller's EnergyState once
+			// this monitor has fully stopped — the local copy above stays
+			// the only thing mutated while the step is still running.
+			result.setThreshold(newThresholdJ)
 		}
 	}
 }

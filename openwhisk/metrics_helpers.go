@@ -607,9 +607,10 @@ func (ap *ActionProxy) recordMetricsImpl(
 		EnergyAttributed: attributed,
 	}
 	if meta != nil {
-		entry.TraceID      = meta.TraceID
-		entry.PodName      = meta.PodName
-		entry.ActivationID = meta.ActivationID
+		entry.TraceID        = meta.TraceID
+		entry.PodName        = meta.PodName
+		entry.ActivationID   = meta.ActivationID
+		entry.ExecutionPhase = meta.ExecutionPhase
 	}
 
 	if ap.metrics != nil {
@@ -621,6 +622,12 @@ func (ap *ActionProxy) recordMetricsImpl(
 		if ap.pendingInitEntry != nil {
 			ap.pendingInitEntry.TraceID      = entry.TraceID
 			ap.pendingInitEntry.ActivationID = entry.ActivationID
+			// D4 (§6.10): the /init point belongs to the same invocation
+			// as this /run, so it must carry the same phase. Left
+			// untagged it would default to "forward" at read time and a
+			// compensation container's init energy would leak into the
+			// forward reference — the very contamination D4 removes.
+			ap.pendingInitEntry.ExecutionPhase = entry.ExecutionPhase
 			pending := *ap.pendingInitEntry
 			ap.pendingInitEntry = nil
 			ap.pendingInitMu.Unlock()

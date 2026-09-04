@@ -203,6 +203,31 @@ func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *
 		if killed, consumedJ, pauseID := monitorResult.get(); killed {
 			killInfo = &EnergyKillInfo{EnergyConsumedJ: consumedJ, PauseID: pauseID}
 		}
+		// D1 (real-cluster smoke test, CLAUDE.md §7.8 point 2): publish
+		// the threshold this step actually ended up running under — after
+		// every extension granted during its pause cycles — back onto the
+		// caller's EnergyState, which is the struct ReinjectEnergyState()
+		// serialises into __energy_state for the NEXT sequence step.
+		//
+		// Safe to mutate here and nowhere earlier: monitorFinished is
+		// closed, so the monitor goroutine has fully returned and is no
+		// longer touching anything; the action has already produced its
+		// output. That preserves monitorEnergy()'s own guarantee (the
+		// caller's struct is never mutated WHILE the step runs) while
+		// still handing the next step a threshold it has not already
+		// exceeded.
+		//
+		// Without this, step N+1 inherited step N's PRE-extension
+		// threshold together with a consumed_before_j well above it, and
+		// (max_pause_count defaulting to 1) burned its only pause cycle on
+		// a spurious freeze — triggering a fallback kill, and a full
+		// compensation for a COMPENSATABLE action, on a sequence still
+		// comfortably inside its extended envelope. Measured live: the
+		// scheduler had raised the threshold to 7.45 J, step 2 received
+		// 1.945 J with consumed_before_j = 5.508 J.
+		if thresholdJ, updated := monitorResult.finalThreshold(); updated && energy != nil {
+			energy.ExecutionThresholdJ = thresholdJ
+		}
 	}
 
 	proc.cmd.Stdout.Write([]byte(OutputGuard))

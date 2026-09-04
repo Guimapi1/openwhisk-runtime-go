@@ -22,6 +22,17 @@ type collectorPayload struct {
 	TraceID          string `json:"energy_trace_id"`
 	PodName          string `json:"pod_name"`
 	ActivationID     string `json:"activation_id"`
+	// D4 (CLAUDE.md §0 decision 23, §6.10). THIS is the field that
+	// actually crosses the wire — collectorPayload is a separate struct
+	// from Entry and copies field by field, so an Entry field that is not
+	// mirrored here never reaches the collector at all. Omitting it was a
+	// real gap in the first cut of D4: Entry.ExecutionPhase was populated
+	// correctly and asserted via ap.metrics (the in-process store), but
+	// the collector kept receiving untagged points and defaulting every
+	// compensation to "forward". omitempty mirrors Entry's own tag: an
+	// unmanaged action sends no phase, which the collector resolves to
+	// "forward" (executionPhaseOrDefault).
+	ExecutionPhase   string `json:"execution_phase,omitempty"`
 }
 
 // pushMetrics envoie les métriques d'une entrée vers le collecteur central.
@@ -43,6 +54,7 @@ func pushMetrics(endpoint string, entry Entry) {
 		TraceID:          entry.TraceID,
 		PodName:          entry.PodName,
 		ActivationID:     entry.ActivationID,
+		ExecutionPhase:   entry.ExecutionPhase,
 	}
 
 	body, err := json.Marshal(payload)
