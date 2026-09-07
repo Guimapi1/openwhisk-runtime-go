@@ -2,6 +2,9 @@ package openwhisk
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -148,4 +151,85 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// ── Ce que pushMetrics envoie RÉELLEMENT sur le réseau ────────────────
+//
+// Les tests ci-dessus assertent sur Entry — l'entité en processus. C'est
+// insuffisant, et ça a échoué en conditions réelles : pushMetrics ne
+// sérialise pas Entry, il recopie champ par champ dans collectorPayload.
+// Un champ ajouté à Entry seul passe donc tous les tests en processus et
+// n'atteint jamais le collecteur. C'est ainsi que D4 a été livré cassé
+// (voir le commentaire de ExecutionPhase dans pushgateway.go), et ainsi
+// que ce champ-ci l'a été à sa première exécution sur cluster.
+//
+// Ces tests interceptent le POST lui-même. C'est le seul niveau où la
+// garantie « la donnée traverse les trois composants » est vérifiable
+// côté runtime.
+
+func TestPushMetricsSendsLifecycleOverTheWire(t *testing.T) {
+	var received []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	t.Setenv("COLLECTOR_URL", srv.URL)
+
+	pushMetrics("/run", Entry{
+		Start: 1, End: 2, TraceID: "trace-wire",
+		Lifecycle: &Lifecycle{
+			MonitorSamples:   7,
+			SidecarExtractNs: 1200,
+			Cycles: []PauseCycle{{
+				PauseID:                  "pause-wire",
+				ThresholdDetectedAt:      500.0,
+				EnergyAtThresholdJ:       3.0,
+				FreezeEffectiveAt:        500.2,
+				EnergyAtEffectiveFreezeJ: 3.1,
+				Outcome:                  "resumed",
+			}},
+		},
+	})
+
+	if len(received) == 0 {
+		t.Fatal("collector received nothing")
+	}
+	var decoded struct {
+		Lifecycle *Lifecycle `json:"lifecycle"`
+	}
+	if err := json.Unmarshal(received, &decoded); err != nil {
+		t.Fatalf("collector could not decode the payload: %v (%s)", err, received)
+	}
+	if decoded.Lifecycle == nil {
+		t.Fatalf("lifecycle never reached the wire: %s", received)
+	}
+	if decoded.Lifecycle.MonitorSamples != 7 {
+		t.Fatalf("MonitorSamples = %d, want 7", decoded.Lifecycle.MonitorSamples)
+	}
+	if len(decoded.Lifecycle.Cycles) != 1 {
+		t.Fatalf("cycles on the wire = %d, want 1", len(decoded.Lifecycle.Cycles))
+	}
+	if got := decoded.Lifecycle.Cycles[0].PauseID; got != "pause-wire" {
+		t.Fatalf("pause_id on the wire = %q, want pause-wire", got)
+	}
+	if got := decoded.Lifecycle.Cycles[0].EnergyAtEffectiveFreezeJ; got != 3.1 {
+		t.Fatalf("energy_at_effective_freeze_j on the wire = %v, want 3.1", got)
+	}
+}
+
+func TestPushMetricsOmitsLifecycleForUnmanagedAction(t *testing.T) {
+	var received []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	t.Setenv("COLLECTOR_URL", srv.URL)
+
+	pushMetrics("/run", Entry{Start: 1, End: 2, TraceID: "trace-legacy"})
+
+	if contains(string(received), "lifecycle") {
+		t.Fatalf("an unmanaged action must send no lifecycle key: %s", received)
+	}
 }

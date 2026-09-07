@@ -32,7 +32,15 @@ type collectorPayload struct {
 	// compensation to "forward". omitempty mirrors Entry's own tag: an
 	// unmanaged action sends no phase, which the collector resolves to
 	// "forward" (executionPhaseOrDefault).
-	ExecutionPhase   string `json:"execution_phase,omitempty"`
+	ExecutionPhase string `json:"execution_phase,omitempty"`
+
+	// Lifecycle (§7.9, PHASE13A). Added here for the SAME reason
+	// ExecutionPhase carries the warning above: this struct — not Entry —
+	// is what actually goes over the wire. A field added to Entry alone
+	// is asserted green by every in-process test and still never reaches
+	// the collector. That is exactly how D4 shipped broken, and how this
+	// field shipped broken on its first cluster run.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 }
 
 // pushMetrics envoie les métriques d'une entrée vers le collecteur central.
@@ -55,6 +63,7 @@ func pushMetrics(endpoint string, entry Entry) {
 		PodName:          entry.PodName,
 		ActivationID:     entry.ActivationID,
 		ExecutionPhase:   entry.ExecutionPhase,
+		Lifecycle:        entry.Lifecycle,
 	}
 
 	body, err := json.Marshal(payload)
