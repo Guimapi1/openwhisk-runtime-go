@@ -63,7 +63,7 @@ func ExampleNewExecutor_bc() {
 	proc := NewExecutor(log, log, "_test/bc.sh", m)
 	err := proc.Start(false)
 	fmt.Println(err)
-	res, _, _ := proc.Interact([]byte("2+2"), nil)
+	res, _, _, _ := proc.Interact([]byte("2+2"), nil)
 	fmt.Printf("%s", res)
 	proc.Stop()
 	dump(log)
@@ -79,7 +79,7 @@ func ExampleNewExecutor_hello() {
 	proc := NewExecutor(log, log, "_test/hello.sh", m)
 	err := proc.Start(false)
 	fmt.Println(err)
-	res, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
+	res, _, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
 	fmt.Printf("%s", res)
 	proc.Stop()
 	dump(log)
@@ -96,7 +96,7 @@ func ExampleNewExecutor_env() {
 	proc := NewExecutor(log, log, "_test/env.sh", map[string]string{"TEST_HELLO": "WORLD", "TEST_HI": "ALL"})
 	err := proc.Start(false)
 	fmt.Println(err)
-	res, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
+	res, _, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
 	fmt.Printf("%s", res)
 	proc.Stop()
 	dump(log)
@@ -146,7 +146,7 @@ func ExampleNewExecutor_helloack() {
 	proc := NewExecutor(log, log, "_test/helloack/exec", m)
 	err := proc.Start(true)
 	fmt.Println(err)
-	res, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
+	res, _, _, _ := proc.Interact([]byte(`{"value":{"name":"Mike"}}`), nil)
 	fmt.Printf("%s", res)
 	proc.Stop()
 	dump(log)
@@ -397,7 +397,7 @@ func TestExecutor_Interact_EnergyKillCoversChildProcesses(t *testing.T) {
 		ConsumedBeforeJ:     1.0,
 		PauseEnabled:        false,
 	}
-	_, _, killInfo := proc.Interact([]byte("x"), energy)
+	_, _, killInfo, _ := proc.Interact([]byte("x"), energy)
 	require.NotNil(t, killInfo, "the main process should have been killed")
 
 	deadline = time.Now().Add(2 * time.Second)

@@ -150,9 +150,15 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		// code ever sees them, and re-encode the body accordingly. No-op
 		// (energyState stays nil) when neither is present.
 		var cleanedValue map[string]interface{}
+		extractStart := time.Now()
 		energyState, cleanedValue = ExtractEnergyState(req.Value)
+		extractNs := time.Since(extractStart).Nanoseconds()
 		if energyState != nil {
 			req.Value = cleanedValue
+			// §7.9 "coût du sidecar", moitié entrante. Posé avant
+			// Interact(), qui écrasera meta.Lifecycle avec le sien —
+			// d'où la fusion explicite au retour d'Interact().
+			meta.Lifecycle = &Lifecycle{SidecarExtractNs: extractNs}
 			// THIS step's own action name, reliably resolved and
 			// short-normalized (energyMonitor.go's
 			// isNonInterruptibleForThisStep, EnergyState's own
@@ -190,7 +196,18 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 	body = bytes.Replace(body, []byte("\n"), []byte(""), -1)
 
 	// execute the action
-	response, err, killInfo := ap.theExecutor.Interact(body, energyState)
+	response, err, killInfo, lifecycle := ap.theExecutor.Interact(body, energyState)
+	// §7.9 (PHASE13A). Merged rather than assigned: the sidecar timings
+	// below are measured HERE, outside Interact, so both halves have to
+	// land on the same struct.
+	if lifecycle != nil {
+		if meta.Lifecycle == nil {
+			meta.Lifecycle = lifecycle
+		} else {
+			lifecycle.SidecarExtractNs = meta.Lifecycle.SidecarExtractNs
+			meta.Lifecycle = lifecycle
+		}
+	}
 
 	// Energy threshold reached (CLAUDE.md §3.1, §7.2): the process is
 	// already dead, killed locally either synchronously (pauseEnabled=
@@ -306,7 +323,21 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		measuredJ := float64(attributedEnergyUJ(energyStart, stepEnergyEnd, cpuStart, stepCPUEnd)) / 1e6
 
+		injectStart := time.Now()
 		updatedObjmap, reinjectErr := ReinjectEnergyState(objmap, energyState, measuredJ)
+		injectNs := time.Since(injectStart).Nanoseconds()
+		if meta.Lifecycle != nil {
+			meta.Lifecycle.SidecarInjectNs = injectNs
+			// Taille sérialisée réelle de __energy_state (§7.8) : ce que
+			// le sidecar ajoute au corps transmis à l'étape suivante.
+			if reinjectErr == nil {
+				if st, ok := updatedObjmap[energyStateKey]; ok {
+					if b, mErr := json.Marshal(st); mErr == nil {
+						meta.Lifecycle.SidecarStateBytes = int64(len(b))
+					}
+				}
+			}
+		}
 		if reinjectErr != nil {
 			log.Printf("[energy_state] failed to reinject energy state: %v", reinjectErr)
 		} else if newResponse, marshalErr := json.Marshal(updatedObjmap); marshalErr == nil {

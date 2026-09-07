@@ -205,7 +205,7 @@ func TestEnergyState_CallerStructNotMutatedUntilStepEnds(t *testing.T) {
 	require.NoError(t, ap.StartLatestAction())
 	defer ap.theExecutor.Stop()
 
-	_, _, killInfo := ap.theExecutor.Interact([]byte("{}"), energy)
+	_, _, killInfo, _ := ap.theExecutor.Interact([]byte("{}"), energy)
 	require.Nil(t, killInfo, "the step must have resumed, not been killed")
 
 	mu.Lock()

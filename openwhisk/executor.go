@@ -154,7 +154,12 @@ func (proc *Executor) CgroupPath() string {
 // ExecutionThresholdJ with PauseEnabled=false (CLAUDE.md §3.1: no
 // scheduler round-trip before this kill — that would open an unbounded
 // overshoot window). nil for a normal completion or an unrelated failure.
-func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *EnergyKillInfo) {
+// The fourth return value is this invocation's §7.9 instrumentation
+// (PHASE13A), nil when nothing was monitored (an unmanaged action).
+// Returned explicitly rather than parked on the Executor: the Executor
+// outlives an invocation in a warm container, so per-invocation state
+// stored there would silently leak into the next one.
+func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *EnergyKillInfo, *Lifecycle) {
 	// input to the subprocess
 	proc.input.Write(in)
 	proc.input.Write([]byte("\n"))
@@ -191,6 +196,7 @@ func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *
 	}
 
 	var killInfo *EnergyKillInfo
+	var lifecycle *Lifecycle
 	if monitorResult != nil {
 		// Stop the monitor and wait for it to have fully returned before
 		// reading its result — otherwise a kill decided concurrently,
@@ -228,11 +234,15 @@ func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *
 		if thresholdJ, updated := monitorResult.finalThreshold(); updated && energy != nil {
 			energy.ExecutionThresholdJ = thresholdJ
 		}
+		// §7.9 (PHASE13A): read AFTER monitorFinished is closed, for the
+		// same reason the kill result is — the monitor goroutine is the
+		// only writer and has fully returned by here.
+		lifecycle = monitorResult.snapshotLifecycle()
 	}
 
 	proc.cmd.Stdout.Write([]byte(OutputGuard))
 	proc.cmd.Stderr.Write([]byte(OutputGuard))
-	return out, err, killInfo
+	return out, err, killInfo, lifecycle
 }
 
 // Exited checks if the underlying command exited

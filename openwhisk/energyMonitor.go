@@ -105,6 +105,11 @@ type energyMonitorResult struct {
 	// mutation window on the shared struct.
 	thresholdJ       float64
 	thresholdUpdated bool
+
+	// §7.9 instrumentation (PHASE13A). Accumulated under the same mutex
+	// as everything else here: the monitor goroutine writes, Interact()
+	// reads once the monitor has stopped.
+	lifecycle Lifecycle
 }
 
 func (r *energyMonitorResult) setKilled(consumedJ float64, pauseID string) {
@@ -130,6 +135,49 @@ func (r *energyMonitorResult) finalThreshold() (float64, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.thresholdJ, r.thresholdUpdated
+}
+
+// noteSample records one monitoring iteration and the wall time its
+// sampling body took (§7.9 monitoring overhead — see Lifecycle's own
+// comment on why this is deliberately not called CPU time).
+func (r *energyMonitorResult) noteSample(busy time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lifecycle.MonitorSamples++
+	r.lifecycle.MonitorBusyNs += busy.Nanoseconds()
+}
+
+// addCycle appends one completed pause cycle (§7.9, per-cycle half).
+func (r *energyMonitorResult) addCycle(c PauseCycle) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lifecycle.Cycles = append(r.lifecycle.Cycles, c)
+}
+
+// noteKill records §7.9's kill_requested_at / process_stopped_at. Kept at
+// the INVOCATION level on purpose: §3.1's local kill (pauseEnabled=false)
+// runs with no pause cycle at all, so a per-cycle field would leave
+// exactly the KILL_SAFE path unmeasured.
+func (r *energyMonitorResult) noteKill(requestedAt, stoppedAt time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lifecycle.KillRequestedAt = float64(requestedAt.UnixNano()) / 1e9
+	r.lifecycle.ProcessStoppedAt = float64(stoppedAt.UnixNano()) / 1e9
+}
+
+// snapshotLifecycle returns a copy for the caller to attach to RunMeta,
+// or nil when nothing was instrumented (an unmanaged action) so the
+// field stays absent from the JSON entirely.
+func (r *energyMonitorResult) snapshotLifecycle() *Lifecycle {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lifecycle.MonitorSamples == 0 && len(r.lifecycle.Cycles) == 0 &&
+		r.lifecycle.KillRequestedAt == 0 {
+		return nil
+	}
+	out := r.lifecycle
+	out.Cycles = append([]PauseCycle(nil), r.lifecycle.Cycles...)
+	return &out
 }
 
 func (r *energyMonitorResult) get() (bool, float64, string) {
@@ -381,17 +429,29 @@ func (proc *Executor) monitorEnergy(
 		case <-stop:
 			return
 		case <-ticker.C:
+			sampleStart := time.Now()
 			energyNow, err := readEnergy()
 			if err != nil {
+				result.noteSample(time.Since(sampleStart))
 				log.Printf("[energy_monitor] readEnergy (trace=%s): %v", energy.TraceID, err)
 				continue
 			}
 			cpuNow := readCPUSnapshot(proc.Pid())
 			stepJ := float64(attributedEnergyUJ(energyStart, energyNow, cpuStart, cpuNow)) / 1e6
+			result.noteSample(time.Since(sampleStart))
 
 			if energy.ConsumedBeforeJ+stepJ < energy.ExecutionThresholdJ {
 				continue
 			}
+
+			// §7.9 threshold_detected_at / energy_at_threshold, captured
+			// HERE rather than inside runPauseCycle: this is the instant
+			// the monitor decided the threshold was crossed, before any
+			// freeze is asked for. The gap between this and the effective
+			// freeze is precisely the energy the guard has to absorb
+			// (§4.4), so both ends must be measured on the same clock.
+			thresholdDetectedAt := time.Now()
+			energyAtThresholdJ := energy.ConsumedBeforeJ + stepJ
 
 			if !energy.PauseEnabled {
 				if isNonInterruptibleForThisStep(&energy) {
@@ -416,14 +476,34 @@ func (proc *Executor) monitorEnergy(
 						"(pauseEnabled=false, CLAUDE.md §3.1).",
 					energy.TraceID, energy.ConsumedBeforeJ, stepJ, energy.ExecutionThresholdJ,
 				)
+				killRequestedAt := time.Now()
 				if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, ""); err != nil {
 					log.Printf("[energy_monitor] killExecution failed for trace=%s: %v", energy.TraceID, err)
 				}
+				// §7.9: the ONLY kill path with no pause cycle (§3.1).
+				// Recorded at the invocation level so it is measurable at
+				// all — see Lifecycle.KillRequestedAt's own comment.
+				result.noteKill(killRequestedAt, time.Now())
 				result.setKilled(stepJ, "")
 				return
 			}
 
-			newThresholdJ, killed, pauseID := proc.runPauseCycle(&energy, actionName, stepJ)
+			newThresholdJ, killed, pauseID := proc.runPauseCycle(
+				&energy, actionName, stepJ, result, thresholdDetectedAt, energyAtThresholdJ,
+				// Re-samples THIS step's attributed energy on demand,
+				// against the same baselines the loop uses — the only way
+				// runPauseCycle can measure energy at effective freeze and
+				// at effective resume without duplicating the baselines.
+				func() float64 {
+					e, err := readEnergy()
+					if err != nil {
+						return stepJ
+					}
+					return float64(attributedEnergyUJ(
+						energyStart, e, cpuStart, readCPUSnapshot(proc.Pid()),
+					)) / 1e6
+				},
+			)
 			if killed {
 				result.setKilled(stepJ, pauseID)
 				return
@@ -452,8 +532,22 @@ func (proc *Executor) monitorEnergy(
 // pause_id).
 func (proc *Executor) runPauseCycle(
 	energy *EnergyState, actionName string, stepJ float64,
+	result *energyMonitorResult, thresholdDetectedAt time.Time, energyAtThresholdJ float64,
+	sampleStepJ func() float64,
 ) (newThresholdJ float64, killed bool, pauseID string) {
 	pauseID = newPauseID()
+	// §7.9 (PHASE13A): this cycle's own record. Filled in as the cycle
+	// progresses and appended on EVERY exit path — including the ones
+	// that kill or stay queued, since a cycle that did not resume is
+	// exactly as interesting for the evaluation as one that did.
+	cycle := PauseCycle{
+		PauseID:             pauseID,
+		ThresholdDetectedAt: float64(thresholdDetectedAt.UnixNano()) / 1e9,
+		EnergyAtThresholdJ:  energyAtThresholdJ,
+		ExecutionThresholdJ: energy.ExecutionThresholdJ,
+		Outcome:             "killed",
+	}
+	defer func() { result.addCycle(cycle) }()
 	// PLAYBOOK.md Phase 16 (CLAUDE.md §0 decision 18, §3.3): resolved
 	// ONCE per cycle. For an UNKILLABLE step, EVERY path that would
 	// otherwise end in a local kill (freeze failure, channel failure,
@@ -487,6 +581,12 @@ func (proc *Executor) runPauseCycle(
 	}
 	effectiveAt := time.Now()
 	freezeLatencyMs := float64(effectiveAt.Sub(requestedAt).Microseconds()) / 1000.0
+	cycle.FreezeRequestedAt = float64(requestedAt.UnixNano()) / 1e9
+	cycle.FreezeEffectiveAt = float64(effectiveAt.UnixNano()) / 1e9
+	// §7.9 energy_at_effective_freeze — the left-hand side of §4.4's
+	// invariant. Read AFTER the cgroup is confirmed frozen, so it counts
+	// everything the guard had to absorb between detection and freeze.
+	cycle.EnergyAtEffectiveFreezeJ = energy.ConsumedBeforeJ + sampleStepJ()
 
 	event := ExecutionPausedEvent{
 		Event:            "EXECUTION_PAUSED",
@@ -517,14 +617,22 @@ func (proc *Executor) runPauseCycle(
 			return 0, false, pauseID, true // retry
 		}
 		log.Printf("[safety] %s for trace=%s pause=%s — killing (%s).", event, energy.TraceID, pauseID, detail)
+		killRequestedAt := time.Now()
 		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
 			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
 		}
-		return 0, true, pauseID, false // kill, do not retry
+		result.noteKill(killRequestedAt, time.Now()) // §7.9
+		return 0, true, pauseID, false               // kill, do not retry
 	}
 
 	for {
+		// §7.9 "coût de gestion des commandes": POST sent -> command
+		// decoded. Overwritten on each re-poll, so for an UNKILLABLE step
+		// this ends up holding the LAST round-trip — the one that actually
+		// carried the resume — rather than an average over its wait.
+		commandSentAt := time.Now()
 		command, err := postExecutionPaused(event, energy.MaxPauseDurationMs)
+		cycle.CommandRoundtripNs = time.Since(commandSentAt).Nanoseconds()
 		if err != nil {
 			if nt, k, pid, retry := killOrRetry("PAUSE_CHANNEL_FAILED", "warning",
 				fmt.Sprintf("EXECUTION_PAUSED channel call failed: %v", err)); !retry {
@@ -546,6 +654,7 @@ func (proc *Executor) runPauseCycle(
 
 		switch command.Command {
 		case "RESUME_EXECUTION":
+			resumeRequestedAt := time.Now()
 			if err := proc.controller.resumeExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
 				if nt, k, pid, retry := killOrRetry("RESUME_FAILED", "critical",
 					fmt.Sprintf("resumeExecution failed: %v", err)); !retry {
@@ -553,6 +662,16 @@ func (proc *Executor) runPauseCycle(
 				}
 				continue
 			}
+			resumeEffectiveAt := time.Now()
+			// §7.9 resume_requested_at / resume_effective_at, plus the
+			// energy attributed while frozen: EnergyAtResumeEffectiveJ −
+			// EnergyAtEffectiveFreezeJ should be ≈ 0 if the cgroup freeze
+			// is genuinely effective. That difference is a VERIFICATION
+			// of the freezer, not a cost — see Lifecycle's comment.
+			cycle.ResumeRequestedAt = float64(resumeRequestedAt.UnixNano()) / 1e9
+			cycle.ResumeEffectiveAt = float64(resumeEffectiveAt.UnixNano()) / 1e9
+			cycle.EnergyAtResumeEffectiveJ = energy.ConsumedBeforeJ + sampleStepJ()
+			cycle.Outcome = "resumed"
 			log.Printf(
 				"[resume] trace=%s pause=%s resumed, new_threshold=%.4fJ",
 				energy.TraceID, pauseID, command.NewExecutionThresholdJ,
@@ -570,6 +689,11 @@ func (proc *Executor) runPauseCycle(
 				}
 				continue
 			}
+			// §7.9: mark the cycle as still waiting. Overwritten by
+			// "resumed" if a later re-poll grants the extension; stays
+			// queued_wait if the container is reclaimed first (§6.9's
+			// orphan case), which is exactly when we want it visible.
+			cycle.Outcome = "queued_wait"
 			log.Printf(
 				"[pause] WAIT_EXECUTION trace=%s pause=%s reason=%s — UNKILLABLE awaiting "+
 					"capacity (§4.11), staying frozen, re-polling in %s.",
@@ -596,9 +720,11 @@ func (proc *Executor) runPauseCycle(
 				continue
 			}
 			log.Printf("[energy_monitor] KILL_EXECUTION received for trace=%s pause=%s reason=%s", energy.TraceID, pauseID, command.Reason)
+			killRequestedAt := time.Now()
 			if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
 				log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, err)
 			}
+			result.noteKill(killRequestedAt, time.Now()) // §7.9
 			return 0, true, pauseID
 
 		default:

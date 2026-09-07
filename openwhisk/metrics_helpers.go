@@ -611,6 +611,9 @@ func (ap *ActionProxy) recordMetricsImpl(
 		entry.PodName        = meta.PodName
 		entry.ActivationID   = meta.ActivationID
 		entry.ExecutionPhase = meta.ExecutionPhase
+		// §7.9 (PHASE13A). nil for an unmanaged action, in which case
+		// omitempty keeps the payload byte-identical to before this phase.
+		entry.Lifecycle      = meta.Lifecycle
 	}
 
 	if ap.metrics != nil {
