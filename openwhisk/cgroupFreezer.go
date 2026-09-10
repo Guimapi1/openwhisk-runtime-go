@@ -465,20 +465,119 @@ func (a *ActivationController) killExecution(traceID, reservationID, pauseID str
 	}
 
 	a.state = StateKilling
+
+	// INSTRUMENTATION (2026-09-10). Ce chemin a ete localise par mesure
+	// comme celui ou le runtime disparait sous saturation : le conteneur
+	// journalise « KILL_EXECUTION received » puis PLUS RIEN — ni echec de
+	// killExecution, ni EXECUTION_KILLED — jusqu'a ce que l'invoker
+	// reclame le conteneur a 180 s (LIMITE_KILL_NON_CONFIRME.md, trace
+	// 34012ac8). Deux attentes seulement peuvent l'expliquer, et les
+	// lignes ci-dessous les separent sans ambiguite :
+	//   - cg.kill() -> bornee par CGROUP_KILL_TIMEOUT_MS, et un
+	//     depassement RETOURNE une erreur (donc serait deja journalise) ;
+	//   - waiter.wait() -> NON bornee, et c'est un sync.Once partage avec
+	//     le ramasseur d'arriere-plan de Executor.Start(). sync.Once.Do
+	//     bloque les appelants concurrents jusqu'au retour du PREMIER :
+	//     si le ramasseur est deja dans cmd.Wait() sur un processus qui
+	//     ne meurt pas, on y reste indefiniment.
+	// Noter que le verrou a.mu est tenu pendant toute la fonction : un
+	// blocage ici gele aussi toute autre operation du controleur.
+	killStart := time.Now()
 	if err := a.cg.kill(); err != nil {
 		a.state = StateUnknown
+		log.Printf(
+			"[kill] trace=%s pause=%s: cgroup.kill ECHEC apres %.1f ms: %v",
+			traceID, pauseID, float64(time.Since(killStart).Microseconds())/1000.0, err,
+		)
 		return newTransitionError("kill", StateKilling, pauseID, err.Error())
 	}
+	log.Printf(
+		"[kill] trace=%s pause=%s: cgroup.kill confirme (populated=0) en %.1f ms — "+
+			"attente de reaping ensuite",
+		traceID, pauseID, float64(time.Since(killStart).Microseconds())/1000.0,
+	)
+
 	// cgroup.events populated=0 confirms the kernel has torn the process
 	// down, but it may still be a zombie until reaped — STOPPED must
 	// mean genuinely gone, not just cgroup-unpopulated (a caller probing
 	// liveness via kill(pid, 0) would otherwise still see it "alive").
 	if a.cmd != nil {
-		_ = a.waiter.wait(a.cmd)
+		waitStart := time.Now()
+		if budget := killConfirmWaitTimeout(); budget > 0 {
+			// Borne OPTIONNELLE, desactivee par defaut (voir
+			// killConfirmWaitTimeout) : le comportement livre reste
+			// exactement celui d'avant tant que la variable n'est pas
+			// posee. Elle existe pour pouvoir VALIDER le correctif
+			// pressenti sans un second cycle de reconstruction d'image.
+			done := make(chan struct{})
+			go func() {
+				_ = a.waiter.wait(a.cmd)
+				close(done)
+			}()
+			select {
+			case <-done:
+				log.Printf(
+					"[kill] trace=%s pause=%s: processus reape en %.1f ms",
+					traceID, pauseID, float64(time.Since(waitStart).Microseconds())/1000.0,
+				)
+			case <-time.After(budget):
+				logSafetyKillConfirmTimeout(traceID, reservationID, pauseID, budget)
+			}
+		} else {
+			_ = a.waiter.wait(a.cmd)
+			log.Printf(
+				"[kill] trace=%s pause=%s: processus reape en %.1f ms",
+				traceID, pauseID, float64(time.Since(waitStart).Microseconds())/1000.0,
+			)
+		}
 	}
 	a.state = StateStopped
 	a.lastPauseID = pauseID
 	return nil
+}
+
+// killConfirmWaitTimeout lit KILL_CONFIRM_WAIT_TIMEOUT_MS. Defaut 0 =
+// AUCUNE borne, c'est-a-dire le comportement historique inchange : cette
+// fonction est livree pour instrumenter, pas pour modifier la conduite
+// sans decision explicite.
+//
+// Poser une valeur > 0 borne l'attente de reaping qui SUIT la confirmation
+// `populated=0`. C'est defendable : a ce stade le noyau a deja demantele le
+// processus, l'attente ne couvre plus que la moisson du zombie. La
+// depasser signifie qu'on n'a pas pu confirmer la moisson, pas que le
+// processus survit — d'ou un incident [safety] plutot qu'un echec.
+func killConfirmWaitTimeout() time.Duration {
+	ms := 0
+	if v := os.Getenv("KILL_CONFIRM_WAIT_TIMEOUT_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed >= 0 {
+			ms = parsed
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// logSafetyKillConfirmTimeout signale que la moisson du processus n'a pas
+// pu etre confirmee dans le budget imparti. Le cgroup est vide
+// (`populated=0` verifie juste avant), donc la garantie energetique tient ;
+// ce qui manque est la confirmation de moisson.
+func logSafetyKillConfirmTimeout(traceID, reservationID, pauseID string, budget time.Duration) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":          "KILL_CONFIRM_WAIT_TIMEOUT",
+		"severity":       "warning",
+		"trace_id":       traceID,
+		"reservation_id": reservationID,
+		"pause_id":       pauseID,
+		"budget_ms":      budget.Milliseconds(),
+		"detail": "cgroup.kill confirmed populated=0, but reaping the process " +
+			"could not be confirmed within the budget. The cgroup is empty, so " +
+			"the energy guarantee holds; the kill is reported as confirmed and " +
+			"EXECUTION_KILLED is emitted rather than leaving the runtime blocked.",
+	})
+	if err != nil {
+		log.Printf("[safety] KILL_CONFIRM_WAIT_TIMEOUT trace=%s (marshal failed: %v)", traceID, err)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
 }
 
 // WaitForExit blocks until the tracked process has exited, returning
