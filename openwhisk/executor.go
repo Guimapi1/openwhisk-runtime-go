@@ -282,7 +282,42 @@ func (proc *Executor) Start(waitForAck bool) error {
 		// confirmation wait (waitOnce, cgroupFreezer.go) — exec.Cmd.Wait()
 		// must never be called more than once on the same *exec.Cmd.
 		proc.controller.WaitForExit()
-		proc.exited <- true
+
+		// CLOSE, et surtout pas `proc.exited <- true`.
+		//
+		// `exited` est un canal NON BUFFERISE avec UN seul emetteur (cette
+		// goroutine) et PLUSIEURS receveurs : Interact(), Exited(), le
+		// chemin sans ack de Start(), l'initialisation. Un envoi n'est recu
+		// que par UN d'entre eux ; tous les autres attendent pour toujours,
+		// et un simple appel a Exited() (reception non bloquante) suffit a
+		// CONSOMMER le jeton et a affamer definitivement Interact().
+		//
+		// Ce n'etait sans consequence que tant qu'une activation a la fois
+		// traversait un conteneur. Les actions declarent `concurrency: 5` :
+		// OpenWhisk envoie jusqu'a 5 activations simultanees au MEME
+		// conteneur, donc au meme Executor. Mesure du 2026-09-10 (vidage
+		// de piles par SIGQUIT sur un conteneur bloque, s05) : TROIS
+		// goroutines Interact() sur le meme Executor (0xc0000ef800), toutes
+		// en `select`, dont une seule pouvait etre debloquee par le kill.
+		// Les deux autres n'atteignaient donc jamais le push de metriques
+		// ni postExecutionKilled : cote scheduler la trace restait a jamais
+		// non reglee (KILLING), et le conteneur gele jusqu'aux 180 s du
+		// timeout d'action — 4 runs de s05 sur 4, et un invoker finalement
+		// Unresponsive (LIMITE_KILL_NON_CONFIRME.md).
+		//
+		// Un canal ferme libere TOUS les receveurs, presents et futurs, et
+		// ne bloque jamais l'emetteur. Aucun receveur ne lit la valeur —
+		// tous traitent la seule reception comme « le process est mort » —
+		// donc le zero value rendu par un canal ferme leur convient tel
+		// quel. Fermeture unique par construction : cette goroutine est
+		// lancee une fois par Executor.
+		//
+		// NOTE DE PORTEE : ceci corrige le SYMPTOME. Faire passer plusieurs
+		// activations par UN processus d'action et UN couple stdin/stdout
+		// reste malsain — le meme vidage montrait trois lecteurs en
+		// `semacquire` sur le meme flux. La correction de fond est un
+		// Executor PAR ACTIVATION.
+		close(proc.exited)
 	}()
 
 	// not waiting for an ack, so use a timeout
