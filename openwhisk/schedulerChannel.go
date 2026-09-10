@@ -166,23 +166,142 @@ func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (
 	return &command, nil
 }
 
-// postExecutionKilled sends EXECUTION_KILLED fire-and-forget (CLAUDE.md
-// §3.1: must never block the /run response). Errors are only logged —
-// there is nothing more useful to do with a lost delivery than what's
-// already logged locally in runHandler.go/energyMonitor.go, and blocking
-// or retrying here would reintroduce exactly the round-trip §3.1
-// forbids.
+// executionKilledMaxAttempts reads EXECUTION_KILLED_MAX_ATTEMPTS
+// (default 5): how many times EXECUTION_KILLED delivery is attempted
+// before giving up. Env read directly, per this repo's convention.
+func executionKilledMaxAttempts() int {
+	n := 5
+	if v := os.Getenv("EXECUTION_KILLED_MAX_ATTEMPTS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	return n
+}
+
+// executionKilledBackoffBase reads EXECUTION_KILLED_RETRY_BACKOFF_BASE_MS
+// (default 200): base of the exponential backoff between two delivery
+// attempts (base * 2^attempt).
+func executionKilledBackoffBase() time.Duration {
+	ms := 200
+	if v := os.Getenv("EXECUTION_KILLED_RETRY_BACKOFF_BASE_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ms = parsed
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// logSafetyKilledUndelivered emits a critical structured [safety] event
+// when EXECUTION_KILLED could not be delivered at all. Same JSON shape as
+// energyMonitor.go's own [safety] events.
+//
+// This is the signal that was missing entirely. A lost delivery leaves the
+// scheduler-side reservation open forever (nothing else ever settles it,
+// CLAUDE.md §6.9/§11), and the ONLY previous trace of it was a plain log
+// line — invisible in practice, since the logs of a container whose
+// activation has already ended do not reach the invoker.
+func logSafetyKilledUndelivered(event ExecutionKilledEvent, attempts int, lastErr string) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":          "EXECUTION_KILLED_UNDELIVERED",
+		"severity":       "critical",
+		"trace_id":       event.TraceID,
+		"reservation_id": event.ReservationID,
+		"action_name":    event.ActionName,
+		"attempts":       attempts,
+		"last_error":     lastErr,
+		"detail": "EXECUTION_KILLED could not be delivered to the scheduler. " +
+			"Its reservation stays open (CLAUDE.md §11: no terminal status " +
+			"without runtime confirmation) and will only be released by an " +
+			"explicit reconciliation or a scheduler restart.",
+	})
+	if err != nil {
+		log.Printf("[safety] EXECUTION_KILLED undelivered for trace=%s (marshal failed: %v)", event.TraceID, err)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
+}
+
+// postExecutionKilled delivers EXECUTION_KILLED to the scheduler, with
+// bounded retries and an explicit status-code check.
+//
+// It stays OFF the /run response path — its only caller invokes it as
+// `go postExecutionKilled(event)` — so none of this ever delays the
+// response (CLAUDE.md §3.1).
+//
+// Why retrying is legitimate here, contrary to what this function's
+// previous comment claimed ("retrying here would reintroduce exactly the
+// round-trip §3.1 forbids"): §3.1 forbids a round-trip BEFORE the kill,
+// because nothing would stop consumption while the runtime waits for an
+// answer. That reasoning does not apply once the process is already dead
+// — by this point killExecution() has run and the action burns nothing.
+// Retrying costs no energy and blocks no response; the earlier reading
+// conflated two different round-trips.
+//
+// What the previous single fire-and-forget attempt cost, measured on
+// cluster (LIMITE_KILL_NON_CONFIRME.md, 2026-09-07): under s05's
+// saturation the scheduler serialises several blocking EXECUTION_PAUSED
+// calls, so a 5 s window is plausibly exceeded; a single failed POST then
+// orphaned the reservation for good — 4 runs out of 4 left an unsettled
+// trace, and the accumulation eventually drove the invoker Unresponsive.
+//
+// Delivery is idempotent scheduler-side: a re-delivered event whose
+// reservation is already terminal is handled gracefully (§0 decision 28),
+// so a retry after an ambiguous failure is safe.
 func postExecutionKilled(event ExecutionKilledEvent) {
 	body, err := json.Marshal(event)
 	if err != nil {
 		log.Printf("[energy_monitor] failed to marshal EXECUTION_KILLED event for the scheduler channel: %v", err)
 		return
 	}
+
+	maxAttempts := executionKilledMaxAttempts()
+	base := executionKilledBackoffBase()
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(schedulerEventsEndpoint(), "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[energy_monitor] failed to POST EXECUTION_KILLED to the scheduler channel: %v", err)
-		return
+	lastErr := "none"
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(base * time.Duration(1<<uint(attempt-1)))
+		}
+		resp, err := client.Post(schedulerEventsEndpoint(), "application/json", bytes.NewReader(body))
+		if err != nil {
+			lastErr = err.Error()
+			log.Printf(
+				"[energy_monitor] EXECUTION_KILLED delivery attempt %d/%d failed for trace=%s: %v",
+				attempt+1, maxAttempts, event.TraceID, err,
+			)
+			continue
+		}
+		status := resp.StatusCode
+		resp.Body.Close()
+
+		if status >= 200 && status < 300 {
+			if attempt > 0 {
+				log.Printf(
+					"[energy_monitor] EXECUTION_KILLED delivered for trace=%s on attempt %d/%d",
+					event.TraceID, attempt+1, maxAttempts,
+				)
+			}
+			return
+		}
+
+		lastErr = fmt.Sprintf("HTTP %d", status)
+		// 4xx is the scheduler REFUSING this payload — retrying an
+		// identical body cannot change that answer, and would only delay
+		// the [safety] event that says so.
+		if status >= 400 && status < 500 {
+			log.Printf(
+				"[energy_monitor] EXECUTION_KILLED refused for trace=%s: HTTP %d — not retried",
+				event.TraceID, status,
+			)
+			break
+		}
+		log.Printf(
+			"[energy_monitor] EXECUTION_KILLED delivery attempt %d/%d for trace=%s: HTTP %d",
+			attempt+1, maxAttempts, event.TraceID, status,
+		)
 	}
-	defer resp.Body.Close()
+
+	logSafetyKilledUndelivered(event, maxAttempts, lastErr)
 }
