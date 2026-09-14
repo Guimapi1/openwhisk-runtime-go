@@ -40,6 +40,7 @@ package openwhisk
 // (killExecution) is the only kill path either way (open question #3).
 
 import (
+	"io"
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
@@ -189,7 +190,29 @@ func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (
 	if err != nil {
 		return nil, fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
 	}
-	defer resp.Body.Close()
+	// Le corps doit etre DRAINE avant d'etre ferme, sinon la connexion
+	// n'est pas rendue au pool et le transport partage ne sert a rien.
+	//
+	// Constate par la mesure (2026-09-14) : apres avoir partage le
+	// transport, le cout de commande n'avait PAS baisse — 17,4 ms de
+	// mediane contre 15,6 avant, et aucune decroissance entre trois
+	// cycles servis par le MEME conteneur (19,6 -> 18,1 -> 17,1 ms, dont
+	// deux a 42 s d'ecart, donc dans la fenetre IdleConnTimeout de 90 s).
+	// Les symboles `schedulerClient`/`schedulerTransport` etaient pourtant
+	// bien presents dans le binaire deploye — verifie par `strings` dans
+	// le conteneur d'action.
+	//
+	// La cause est une exigence du `net/http` de Go : une connexion n'est
+	// reutilisable que si le corps de la reponse a ete lu jusqu'a EOF
+	// PUIS ferme. `json.Decoder.Decode` s'arrete a la fin de la valeur
+	// JSON et peut laisser des octets (un saut de ligne suffit), ce qui
+	// fait fermer la connexion au lieu de la recycler.
+	//
+	// Partager le transport etait donc NECESSAIRE mais PAS SUFFISANT.
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	var command SchedulerCommand
 	if err := json.NewDecoder(resp.Body).Decode(&command); err != nil {
@@ -306,6 +329,11 @@ func postExecutionKilled(event ExecutionKilledEvent) {
 			continue
 		}
 		status := resp.StatusCode
+		// Meme exigence que pour postExecutionPaused : drainer avant de
+		// fermer, sinon la connexion n'est pas rendue au pool partage.
+		// Ici le corps n'est meme pas lu (seul le statut compte), donc
+		// sans ce drainage la connexion etait systematiquement jetee.
+		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 
 		if status >= 200 && status < 300 {
