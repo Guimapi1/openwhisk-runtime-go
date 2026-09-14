@@ -631,8 +631,16 @@ func (proc *Executor) runPauseCycle(
 		// this ends up holding the LAST round-trip — the one that actually
 		// carried the resume — rather than an average over its wait.
 		commandSentAt := time.Now()
-		command, err := postExecutionPaused(event, energy.MaxPauseDurationMs)
+		command, connTrace, err := postExecutionPaused(event, energy.MaxPauseDurationMs)
 		cycle.CommandRoundtripNs = time.Since(commandSentAt).Nanoseconds()
+		cycle.ConnReused = connTrace.Reused
+		cycle.ConnSetupNs = connTrace.SetupNs
+		log.Printf(
+			"[pause] scheduler channel trace=%s pause=%s conn_reused=%v conn_setup=%.3fms roundtrip=%.3fms",
+			energy.TraceID, pauseID, connTrace.Reused,
+			float64(connTrace.SetupNs)/1e6,
+			float64(cycle.CommandRoundtripNs)/1e6,
+		)
 		if err != nil {
 			if nt, k, pid, retry := killOrRetry("PAUSE_CHANNEL_FAILED", "warning",
 				fmt.Sprintf("EXECUTION_PAUSED channel call failed: %v", err)); !retry {

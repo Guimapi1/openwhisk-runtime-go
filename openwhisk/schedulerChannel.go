@@ -40,13 +40,14 @@ package openwhisk
 // (killExecution) is the only kill path either way (open question #3).
 
 import (
-	"io"
 	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strconv"
 	"time"
@@ -120,6 +121,39 @@ func schedulerClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: schedulerTransport}
 }
 
+// schedulerConnTrace rend OBSERVABLE ce qui n'etait jusqu'ici qu'infere
+// d'une mediane : la connexion TCP a-t-elle ete reutilisee, et combien de
+// temps a coute son obtention.
+//
+// Raison d'etre. Le partage du transport puis le drainage du corps ont
+// tous deux ete deployes sans effet mesurable sur `command_roundtrip_ns`,
+// et rien ne permettait de distinguer « le correctif n'est pas dans
+// l'image » de « le correctif est la mais la connexion n'est quand meme
+// pas recyclee ». Un `strings` sur le binaire ne tranche pas : le
+// drainage est un appel a io.Copy, il n'ajoute aucun symbole propre.
+// httptrace.GotConn repond directement, par cycle de pause.
+type schedulerConnTrace struct {
+	// Reused : net/http a servi la requete sur une connexion deja
+	// etablie. C'est le critere exact que le transport partage + le
+	// drainage visent a rendre vrai a partir du 2e cycle d'un meme
+	// conteneur.
+	Reused bool
+	// SetupNs : debut de la requete -> connexion obtenue. Proche de zero
+	// sur une connexion recyclee, de l'ordre de plusieurs ms sinon.
+	SetupNs int64
+}
+
+// traceRequest habille une requete d'un httptrace qui remplit dst.
+func traceRequest(req *http.Request, dst *schedulerConnTrace) *http.Request {
+	start := time.Now()
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			dst.Reused = info.Reused
+			dst.SetupNs = time.Since(start).Nanoseconds()
+		},
+	}))
+}
+
 func pausedEventTimeout(maxPauseDurationMs int64) time.Duration {
 	if maxPauseDurationMs < 0 {
 		maxPauseDurationMs = 0
@@ -179,16 +213,23 @@ func newPauseID() string {
 // (resume_allowed(pause_id) => extension_success(pause_id)), and this
 // runtime has no way to satisfy that invariant if it cannot even reach
 // the scheduler.
-func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (*SchedulerCommand, error) {
+func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (*SchedulerCommand, schedulerConnTrace, error) {
+	var connTrace schedulerConnTrace
+
 	body, err := json.Marshal(event)
 	if err != nil {
-		return nil, fmt.Errorf("marshal EXECUTION_PAUSED event: %w", err)
+		return nil, connTrace, fmt.Errorf("marshal EXECUTION_PAUSED event: %w", err)
 	}
 
 	client := schedulerClient(pausedEventTimeout(maxPauseDurationMs))
-	resp, err := client.Post(schedulerEventsEndpoint(), "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, schedulerEventsEndpoint(), bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
+		return nil, connTrace, fmt.Errorf("build EXECUTION_PAUSED request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(traceRequest(req, &connTrace))
+	if err != nil {
+		return nil, connTrace, fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
 	}
 	// Le corps doit etre DRAINE avant d'etre ferme, sinon la connexion
 	// n'est pas rendue au pool et le transport partage ne sert a rien.
@@ -216,9 +257,9 @@ func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (
 
 	var command SchedulerCommand
 	if err := json.NewDecoder(resp.Body).Decode(&command); err != nil {
-		return nil, fmt.Errorf("decode scheduler command: %w", err)
+		return nil, connTrace, fmt.Errorf("decode scheduler command: %w", err)
 	}
-	return &command, nil
+	return &command, connTrace, nil
 }
 
 // executionKilledMaxAttempts reads EXECUTION_KILLED_MAX_ATTEMPTS

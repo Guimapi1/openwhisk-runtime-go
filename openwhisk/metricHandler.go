@@ -42,6 +42,15 @@ type PauseCycle struct {
 	// scheduler's command decoded. Dominated by the scheduler round-trip.
 	CommandRoundtripNs int64 `json:"command_roundtrip_ns"`
 
+	// Decomposition de ce round-trip (§7.9). Deux mesures deployees pour
+	// le reduire — transport partage puis drainage du corps — n'avaient
+	// produit aucune baisse observable, sans qu'on puisse dire si elles
+	// etaient absentes de l'image ou presentes mais inoperantes. Ces deux
+	// champs repondent par observation directe plutot que par inference
+	// sur une mediane.
+	ConnReused  bool  `json:"conn_reused,omitempty"`
+	ConnSetupNs int64 `json:"conn_setup_ns,omitempty"`
+
 	// §7.9 resume_requested_at / resume_effective_at. Zero when the cycle
 	// did not end in a resume (killed, or still queued).
 	ResumeRequestedAt        float64 `json:"resume_requested_at,omitempty"`
@@ -103,26 +112,26 @@ type RunMeta struct {
 
 // Entry représente une mesure complète pour une invocation.
 type Entry struct {
-	Start            int64  `json:"start"`
-	End              int64  `json:"end"`
-	EnergyStart      int64  `json:"energy_start"`
-	EnergyEnd        int64  `json:"energy_end"`
+	Start       int64 `json:"start"`
+	End         int64 `json:"end"`
+	EnergyStart int64 `json:"energy_start"`
+	EnergyEnd   int64 `json:"energy_end"`
 	// EnergyAttributed est la fraction d'énergie RAPL attribuée à cette action
 	// via pondération CPU : delta_RAPL × (cpu_process / cpu_total).
 	// Vaut 0 si l'action est trop courte (< ~10ms) ou si RAPL est indisponible.
-	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	EnergyAttributed int64 `json:"energy_attributed_uj"`
 	// Entrees du modele d'attribution (§7.9, audit du 2026-09-14).
 	// `energy_attributed_uj` seul ne permet pas de verifier COMMENT il a
 	// ete obtenu ; ces trois champs rendent `deltaRAPL x cpuRatio`
 	// reconstituable a posteriori. omitempty : une action non geree ou
 	// une mesure insuffisante n'en envoie aucun, la charge utile reste
 	// alors identique a l'octet pres.
-	CPUProcessUsec   int64   `json:"cpu_process_usec,omitempty"`
-	CPUCapacityUsec  int64   `json:"cpu_capacity_usec,omitempty"`
-	CPURatio         float64 `json:"cpu_ratio,omitempty"`
-	TraceID          string `json:"energy_trace_id"`
-	PodName          string `json:"pod_name"`
-	ActivationID     string `json:"activation_id"`
+	CPUProcessUsec  int64   `json:"cpu_process_usec,omitempty"`
+	CPUCapacityUsec int64   `json:"cpu_capacity_usec,omitempty"`
+	CPURatio        float64 `json:"cpu_ratio,omitempty"`
+	TraceID         string  `json:"energy_trace_id"`
+	PodName         string  `json:"pod_name"`
+	ActivationID    string  `json:"activation_id"`
 	// ExecutionPhase discriminates a forward invocation from a compensation
 	// one (CLAUDE.md §0 decision 23, §6.10). The collector writes it as an
 	// indexed TAG so get_energy_reference() can exclude recovery samples
@@ -131,11 +140,11 @@ type Entry struct {
 	// energy stays committed to the slot, it is only excluded from the
 	// statistical reference). omitempty: an unmanaged action sends no
 	// phase at all rather than an empty string.
-	ExecutionPhase   string `json:"execution_phase,omitempty"`
+	ExecutionPhase string `json:"execution_phase,omitempty"`
 	// Lifecycle (§7.9, PHASE13A). Pointer + omitempty: absent from the
 	// JSON entirely for an unmanaged action, so the collector's existing
 	// decode path is bit-for-bit unaffected.
-	Lifecycle        *Lifecycle `json:"lifecycle,omitempty"`
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 }
 
 // Metrics stocke pour chaque endpoint une slice d'Entry.

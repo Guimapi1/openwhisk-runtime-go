@@ -41,6 +41,15 @@ type collectorPayload struct {
 	// the collector. That is exactly how D4 shipped broken, and how this
 	// field shipped broken on its first cluster run.
 	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
+
+	// Attribution breakdown (§7.9). Troisième occurrence du même défaut que
+	// les deux blocs ci-dessus : les champs avaient été ajoutés à Entry, au
+	// site de remplissage (metrics_helpers.go) et au collecteur, tout était
+	// vert, et ils n'ont jamais franchi le fil parce que cette struct-ci ne
+	// les recopiait pas. Vérifier ici AVANT de reconstruire une image.
+	CPUProcessUsec  int64   `json:"cpu_process_usec,omitempty"`
+	CPUCapacityUsec int64   `json:"cpu_capacity_usec,omitempty"`
+	CPURatio        float64 `json:"cpu_ratio,omitempty"`
 }
 
 // pushMetrics envoie les métriques d'une entrée vers le collecteur central.
@@ -64,6 +73,9 @@ func pushMetrics(endpoint string, entry Entry) {
 		ActivationID:     entry.ActivationID,
 		ExecutionPhase:   entry.ExecutionPhase,
 		Lifecycle:        entry.Lifecycle,
+		CPUProcessUsec:   entry.CPUProcessUsec,
+		CPUCapacityUsec:  entry.CPUCapacityUsec,
+		CPURatio:         entry.CPURatio,
 	}
 
 	body, err := json.Marshal(payload)
