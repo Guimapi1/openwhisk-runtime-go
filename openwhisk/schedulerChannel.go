@@ -87,6 +87,38 @@ func schedulerChannelTimeoutMarginMs() time.Duration {
 // maxPauseDurationMs is THIS pause cycle's own deadline (CLAUDE.md §4.7,
 // as dispatched — or as last updated by a previous RESUME_EXECUTION,
 // though V1 never changes it mid-trace).
+// schedulerTransport est le POOL DE CONNEXIONS partage par tous les
+// appels au scheduler. Un `http.Transport` porte le pool ; le `Client`
+// qui l'enveloppe ne porte que le timeout. On partage donc le transport
+// et on fabrique un client leger par appel — ce qui conserve la
+// reutilisation de connexion SANS renoncer au timeout variable de
+// pausedEventTimeout(), qui depend du max_pause_duration_ms du cycle.
+//
+// Pourquoi ce changement (mesure du 2026-09-14). Chaque appel creait son
+// propre `http.Client`, donc son propre transport, donc une connexion
+// TCP neuve fermee aussitot. Mesure a l'interieur du cluster, 40 appels
+// par bras, meme endpoint en lecture seule :
+//
+//	connexion NEUVE a chaque appel   p50 = 9,115 ms
+//	connexion REUTILISEE             p50 = 0,527 ms   -> facteur 17
+//
+// Rapporte au cout de commande mesure (`command_roundtrip_ns`, mediane
+// 15,55 ms), dont la DECISION du scheduler ne represente que 0,88 ms :
+// l'etablissement de connexion en constituait environ 55 %. §7.9 compte
+// ce cout comme une metrique de premier ordre — il est donc reel, pas
+// cosmetique.
+var schedulerTransport = &http.Transport{
+	MaxIdleConns:        16,
+	MaxIdleConnsPerHost: 8,
+	IdleConnTimeout:     90 * time.Second,
+}
+
+// schedulerClient rend un client au timeout demande, adosse au pool
+// partage ci-dessus.
+func schedulerClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout, Transport: schedulerTransport}
+}
+
 func pausedEventTimeout(maxPauseDurationMs int64) time.Duration {
 	if maxPauseDurationMs < 0 {
 		maxPauseDurationMs = 0
@@ -152,7 +184,7 @@ func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (
 		return nil, fmt.Errorf("marshal EXECUTION_PAUSED event: %w", err)
 	}
 
-	client := &http.Client{Timeout: pausedEventTimeout(maxPauseDurationMs)}
+	client := schedulerClient(pausedEventTimeout(maxPauseDurationMs))
 	resp, err := client.Post(schedulerEventsEndpoint(), "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
@@ -257,7 +289,7 @@ func postExecutionKilled(event ExecutionKilledEvent) {
 
 	maxAttempts := executionKilledMaxAttempts()
 	base := executionKilledBackoffBase()
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := schedulerClient(5 * time.Second)
 	lastErr := "none"
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {

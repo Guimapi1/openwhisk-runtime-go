@@ -111,6 +111,15 @@ type Entry struct {
 	// via pondération CPU : delta_RAPL × (cpu_process / cpu_total).
 	// Vaut 0 si l'action est trop courte (< ~10ms) ou si RAPL est indisponible.
 	EnergyAttributed int64  `json:"energy_attributed_uj"`
+	// Entrees du modele d'attribution (§7.9, audit du 2026-09-14).
+	// `energy_attributed_uj` seul ne permet pas de verifier COMMENT il a
+	// ete obtenu ; ces trois champs rendent `deltaRAPL x cpuRatio`
+	// reconstituable a posteriori. omitempty : une action non geree ou
+	// une mesure insuffisante n'en envoie aucun, la charge utile reste
+	// alors identique a l'octet pres.
+	CPUProcessUsec   int64   `json:"cpu_process_usec,omitempty"`
+	CPUCapacityUsec  int64   `json:"cpu_capacity_usec,omitempty"`
+	CPURatio         float64 `json:"cpu_ratio,omitempty"`
 	TraceID          string `json:"energy_trace_id"`
 	PodName          string `json:"pod_name"`
 	ActivationID     string `json:"activation_id"`

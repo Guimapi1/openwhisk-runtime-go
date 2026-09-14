@@ -439,21 +439,51 @@ func readCPUSnapshotFromCgroup(cgroupPath string) CPUSnapshot {
 // Si RAPL_CORES n'est pas défini, on utilise le nombre total de cores logiques.
 //
 // Retourne 0 si les données sont insuffisantes.
+// AttributionBreakdown porte les ENTREES du modele d'attribution, pas
+// seulement son resultat.
+//
+// Pourquoi ce type existe (audit §7.9 du 2026-09-14). `cpuRatio`,
+// `deltaProcessUsec` et `capacityUsec` etaient calcules a chaque
+// invocation puis ecrits UNIQUEMENT dans le log du conteneur — perdu des
+// que l'invoker reclame le conteneur. Seul le produit final partait au
+// collecteur, donc le modele d'attribution n'etait pas auditable a
+// posteriori.
+//
+// Cout concret de cette lacune : la loi « l'energie attribuee par
+// execution monte de +37 % a profondeur 6, a duree identique » (mesuree
+// le 2026-09-11) a du etre RECONSTRUITE par recoupement de bornes
+// externes, alors que `cpuRatio` l'aurait donnee directement.
+//
+// Champs a zero = donnees insuffisantes, exactement comme le retour 0 de
+// attributedEnergyUJ : ce n'est pas « ratio nul mesure ».
+type AttributionBreakdown struct {
+	AttributedUJ     int64
+	DeltaProcessUsec int64
+	CapacityUsec     int64
+	CPURatio         float64
+}
+
+// attributedEnergyUJ conserve sa signature d'origine : les quatre sites
+// d'appel existants n'ont pas a changer. Elle delegue au calcul detaille.
 func attributedEnergyUJ(energyStart, energyEnd int64, snapStart, snapEnd CPUSnapshot) int64 {
+	return attributionDetail(energyStart, energyEnd, snapStart, snapEnd).AttributedUJ
+}
+
+func attributionDetail(energyStart, energyEnd int64, snapStart, snapEnd CPUSnapshot) AttributionBreakdown {
 	deltaRAPL := deltaRAPLUJ(energyStart, energyEnd)
 	if deltaRAPL <= 0 {
-		return 0
+		return AttributionBreakdown{}
 	}
 
 	deltaProcessUsec := snapEnd.ProcessTicks - snapStart.ProcessTicks
 	if deltaProcessUsec <= 0 {
-		return 0
+		return AttributionBreakdown{}
 	}
 
 	// Durée wall-clock de l'invocation en µs
 	durationUsec := (snapEnd.WallNs - snapStart.WallNs) / 1000
 	if durationUsec <= 0 {
-		return 0
+		return AttributionBreakdown{}
 	}
 
 	// Nombre de cores du socket mesuré
@@ -475,7 +505,12 @@ func attributedEnergyUJ(energyStart, energyEnd int64, snapStart, snapEnd CPUSnap
 	log.Printf("attributedEnergyUJ: deltaRAPL=%dµJ processUsec=%d capacityUsec=%d nbCores=%d cpuRatio=%.4f => attributed=%dµJ",
 		deltaRAPL, deltaProcessUsec, capacityUsec, nbCores, cpuRatio, attributed)
 
-	return attributed
+	return AttributionBreakdown{
+		AttributedUJ:     attributed,
+		DeltaProcessUsec: deltaProcessUsec,
+		CapacityUsec:     capacityUsec,
+		CPURatio:         cpuRatio,
+	}
 }
 
 // countCores compte le nombre de cores dans un masque RAPL_CORES.
@@ -581,7 +616,8 @@ func (ap *ActionProxy) recordMetricsImpl(
 	// Corriger le WallNs de fin avec le timestamp déjà lu
 	cpuEnd.WallNs = end
 
-	attributed := attributedEnergyUJ(energyStart, energyEnd, cpuStart, cpuEnd)
+	detail := attributionDetail(energyStart, energyEnd, cpuStart, cpuEnd)
+	attributed := detail.AttributedUJ
 
 	// Defense-in-depth safety net (CLAUDE.md §6.9), not the primary fix:
 	// the ordering (recordMetricsSync called before ap.theExecutor = nil,
@@ -605,6 +641,9 @@ func (ap *ActionProxy) recordMetricsImpl(
 		EnergyStart:      energyStart,
 		EnergyEnd:        energyEnd,
 		EnergyAttributed: attributed,
+		CPUProcessUsec:   detail.DeltaProcessUsec,
+		CPUCapacityUsec:  detail.CapacityUsec,
+		CPURatio:         detail.CPURatio,
 	}
 	if meta != nil {
 		entry.TraceID        = meta.TraceID
