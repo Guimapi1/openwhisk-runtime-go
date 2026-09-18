@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -485,4 +486,63 @@ func TestRunHandler_EnergyMonitor_ThresholdReadFromBothSidecarSources(t *testing
 			assert.True(t, event.EnergyBudgetExceeded)
 		})
 	}
+}
+
+// The EXECUTION_KILLED event must reach the scheduler BEFORE /run answers:
+// right after that answer the invoker deletes the killed pod (~2 s,
+// measured on cluster 2026-09-18), killing any delivery still in flight.
+// The fake scheduler holds its reply 300 ms; the /run response must come
+// after that reply, never before.
+func TestRunHandler_LocalKill_EventDeliveredBeforeRunResponse(t *testing.T) {
+	t.Setenv("RAPL_PATH", newFakeRAPLFile(t))
+	t.Setenv("ENERGY_MONITOR_INTERVAL_MS", "10")
+	var mu sync.Mutex
+	var repliedAt time.Time
+	received := 0
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = ioutil.ReadAll(r.Body)
+		time.Sleep(300 * time.Millisecond)
+		mu.Lock()
+		received++
+		repliedAt = time.Now()
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ack": true}`))
+	}))
+	defer slow.Close()
+	t.Setenv("SCHEDULER_URL", slow.URL)
+
+	os.RemoveAll("./action/energy_kill_sync")
+	logf, err := ioutil.TempFile("/tmp", "log")
+	require.NoError(t, err)
+	ap := NewActionProxy("./action/energy_kill_sync", "", logf, logf)
+	script := []byte("#!/bin/sh\nwhile read a; do :; done\n")
+	_, err = ap.ExtractAction(&script, "bin")
+	require.NoError(t, err)
+	require.NoError(t, ap.StartLatestAction())
+	ts := httptest.NewServer(ap)
+	defer ts.Close()
+
+	requestBody := `{"value": {
+		"energy_trace_id": "trace-sync",
+		"energy_reservation_id": "trace-sync",
+		"energy_execution_phase": "forward",
+		"energy_execution_threshold_j": 1.0,
+		"energy_consumed_before_j": 1.0,
+		"energy_pause_enabled": false,
+		"energy_pause_mode": "",
+		"energy_max_pause_duration_ms": 0,
+		"energy_max_pause_count": 0,
+		"energy_interruption_class": {"action": "KILL_SAFE"}
+	}, "action_name": "action"}`
+	_, status, err := doPost(ts.URL+"/run", requestBody)
+	answeredAt := time.Now()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusBadRequest, status)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 1, received, "EXECUTION_KILLED not delivered before the /run response")
+	require.False(t, answeredAt.Before(repliedAt),
+		"/run answered before the scheduler had acknowledged EXECUTION_KILLED")
 }

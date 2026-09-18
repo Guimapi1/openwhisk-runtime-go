@@ -259,14 +259,23 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 
 		ap.theExecutor = nil // the process is dead; a fresh one is needed next time
 
-		// Fire-and-forget over the dedicated channel (CLAUDE.md §3.1: must
-		// never block this response — a synchronous call could stall for
-		// up to postExecutionKilled's own timeout on a network hiccup) —
-		// but only AFTER the line above has already guaranteed the
-		// measurement it depends on is safely recorded.
+		// Delivered SYNCHRONOUSLY, before the /run response (2026-09-18).
+		// It used to be `go postExecutionKilled(event)`, then respond. But
+		// as soon as /run answers a killed activation, the invoker logs
+		// "Failed during use of warm container" and DELETES the pod — ~2 s
+		// later, measured on cluster (job 4117253, four local kills). At
+		// idle the POST lands in milliseconds and wins that race; under
+		// load (campaign 2, 384 req/min) it did not: 3 of 3 runtime kills
+		// never reached the scheduler, and the pod died before this
+		// runtime could even log its own EXECUTION_KILLED_UNDELIVERED.
+		// Blocking here costs no energy (the process is already dead) and
+		// is not the round-trip §3.1 forbids, which is the one BEFORE the
+		// kill. It is bounded by postExecutionKilled's own retries (5 x 5 s
+		// plus backoff by default); if it still fails, the scheduler
+		// settles on termination proof (CLAUDE.md decision 31).
 		// Original arguments travel ONLY over this channel, never in the
 		// /run response nor in logs by default (CLAUDE.md §7.6).
-		go postExecutionKilled(event)
+		postExecutionKilled(event)
 
 		log.Printf(
 			"[energy_monitor] EXECUTION_KILLED trace=%s reservation=%s pause=%s phase=%s energy_consumed_j=%.4f",
