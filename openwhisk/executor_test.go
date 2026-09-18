@@ -290,7 +290,7 @@ func TestRunHandler_EnergyMonitor_ExceedsThreshold_EmitsExecutionKilled(t *testi
 		"energy_max_pause_duration_ms": 0,
 		"energy_max_pause_count": 0,
 		"energy_interruption_class": {"action": "KILL_SAFE"}
-	}, "action_name": "action"}`
+	}, "action_name": "action", "activation_id": "act-over-1"}`
 
 	resp, status, err := doPost(ts.URL+"/run", requestBody)
 	require.NoError(t, err)
@@ -310,6 +310,7 @@ func TestRunHandler_EnergyMonitor_ExceedsThreshold_EmitsExecutionKilled(t *testi
 	assert.True(t, event.EnergyBudgetExceeded)
 	assert.True(t, event.EnergyConsumedJ >= 1.0)
 	assert.Equal(t, map[string]interface{}{"quantity": float64(1)}, event.EnergyOriginalArguments)
+	assert.Equal(t, "act-over-1", event.ActivationID) // clé d'idempotence côté scheduler
 }
 
 // 3. Disabled/negative threshold: no kill, monitoring without

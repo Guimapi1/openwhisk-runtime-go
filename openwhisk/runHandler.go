@@ -76,6 +76,9 @@ type ExecutionKilledEvent struct {
 	EnergyBudgetExceeded    bool                   `json:"energy_budget_exceeded"`
 	EnergyConsumedJ         float64                `json:"energy_consumed_j"`
 	EnergyOriginalArguments map[string]interface{} `json:"energy_original_arguments"`
+	// ActivationID de l'étape tuée : clé d'idempotence côté scheduler. Ce runtime REJOUE l'événement quand
+	// l'accusé tarde ; sans clé, le scheduler appliquait le doublon à la tentative suivante (2026-09-18, s07).
+	ActivationID string `json:"activation_id,omitempty"`
 }
 
 type runRequest struct {
@@ -229,6 +232,7 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 			// Already stripped of energy_*/__energy_state above — the
 			// business code never saw anything else either.
 			EnergyOriginalArguments: req.Value,
+			ActivationID:            meta.ActivationID,
 		}
 
 		// Record this activation's own measurement SYNCHRONOUSLY, and
