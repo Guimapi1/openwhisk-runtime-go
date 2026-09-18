@@ -158,11 +158,12 @@ func (r *energyMonitorResult) addCycle(c PauseCycle) {
 // the INVOCATION level on purpose: §3.1's local kill (pauseEnabled=false)
 // runs with no pause cycle at all, so a per-cycle field would leave
 // exactly the KILL_SAFE path unmeasured.
-func (r *energyMonitorResult) noteKill(requestedAt, stoppedAt time.Time) {
+func (r *energyMonitorResult) noteKill(requestedAt, stoppedAt time.Time, cause string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lifecycle.KillRequestedAt = float64(requestedAt.UnixNano()) / 1e9
 	r.lifecycle.ProcessStoppedAt = float64(stoppedAt.UnixNano()) / 1e9
+	r.lifecycle.KillCause = cause
 }
 
 // snapshotLifecycle returns a copy for the caller to attach to RunMeta,
@@ -483,7 +484,7 @@ func (proc *Executor) monitorEnergy(
 				// §7.9: the ONLY kill path with no pause cycle (§3.1).
 				// Recorded at the invocation level so it is measurable at
 				// all — see Lifecycle.KillRequestedAt's own comment.
-				result.noteKill(killRequestedAt, time.Now())
+				result.noteKill(killRequestedAt, time.Now(), "THRESHOLD_NO_PAUSE")
 				result.setKilled(stepJ, "")
 				return
 			}
@@ -574,9 +575,14 @@ func (proc *Executor) runPauseCycle(
 				"(cannot safely continue monitoring an unfrozen, over-threshold process).",
 			energy.TraceID, pauseID, err,
 		)
+		// Ce kill n'était pas horodaté : son point d'invocation ne portait donc
+		// pas kill_requested_at, et l'étape était introuvable pour la preuve
+		// de terminaison (2) de la décision 31.
+		killRequestedAt := time.Now()
 		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
 			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
 		}
+		result.noteKill(killRequestedAt, time.Now(), "FREEZE_FAILED") // §7.9
 		return 0, true, pauseID
 	}
 	effectiveAt := time.Now()
@@ -621,8 +627,8 @@ func (proc *Executor) runPauseCycle(
 		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
 			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
 		}
-		result.noteKill(killRequestedAt, time.Now()) // §7.9
-		return 0, true, pauseID, false               // kill, do not retry
+		result.noteKill(killRequestedAt, time.Now(), event) // §7.9
+		return 0, true, pauseID, false                      // kill, do not retry
 	}
 
 	for {
@@ -732,7 +738,7 @@ func (proc *Executor) runPauseCycle(
 			if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
 				log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, err)
 			}
-			result.noteKill(killRequestedAt, time.Now()) // §7.9
+			result.noteKill(killRequestedAt, time.Now(), "SCHEDULER_COMMAND:"+command.Reason) // §7.9
 			return 0, true, pauseID
 
 		default:

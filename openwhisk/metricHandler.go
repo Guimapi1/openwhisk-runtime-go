@@ -89,6 +89,11 @@ type Lifecycle struct {
 	// cycle-level field would make exactly the KILL_SAFE path invisible.
 	KillRequestedAt  float64 `json:"kill_requested_at,omitempty"`
 	ProcessStoppedAt float64 `json:"process_stopped_at,omitempty"`
+	// KillCause dit POURQUOI ce runtime a tué l'étape (seuil sans pause, gel
+	// échoué, canal EXECUTION_PAUSED en échec, commande du scheduler et sa
+	// raison…) : de quoi expliquer, depuis la mesure seule, un kill dont
+	// l'EXECUTION_KILLED n'est jamais parvenu (CLAUDE.md §0 décision 31).
+	KillCause string `json:"kill_cause,omitempty"`
 
 	Cycles []PauseCycle `json:"cycles,omitempty"`
 }

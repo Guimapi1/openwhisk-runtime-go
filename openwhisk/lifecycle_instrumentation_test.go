@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,7 +58,7 @@ func TestLifecycleRecordsKillWithoutAnyPauseCycle(t *testing.T) {
 	r := &energyMonitorResult{}
 	req := time.Unix(1000, 0)
 	stop := time.Unix(1000, 500000000)
-	r.noteKill(req, stop)
+	r.noteKill(req, stop, "THRESHOLD_NO_PAUSE")
 
 	lc := r.snapshotLifecycle()
 	if lc == nil {
@@ -71,6 +72,14 @@ func TestLifecycleRecordsKillWithoutAnyPauseCycle(t *testing.T) {
 	}
 	if lc.ProcessStoppedAt != 1000.5 {
 		t.Fatalf("ProcessStoppedAt = %v, want 1000.5", lc.ProcessStoppedAt)
+	}
+	if lc.KillCause != "THRESHOLD_NO_PAUSE" {
+		t.Fatalf("KillCause = %q, want THRESHOLD_NO_PAUSE", lc.KillCause)
+	}
+	// Sur le fil : la struct Lifecycle part telle quelle dans collectorPayload.
+	wire, err := json.Marshal(collectorPayload{Lifecycle: lc})
+	if err != nil || !strings.Contains(string(wire), `"kill_cause":"THRESHOLD_NO_PAUSE"`) {
+		t.Fatalf("kill_cause absent de la charge envoyée au collecteur: %s (%v)", wire, err)
 	}
 }
 
