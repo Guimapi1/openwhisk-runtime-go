@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,8 +54,64 @@ type collectorPayload struct {
 	CPURatio        float64 `json:"cpu_ratio,omitempty"`
 }
 
+// metricsPushMaxAttempts lit METRICS_PUSH_MAX_ATTEMPTS (défaut 3) : nombre de tentatives d'envoi d'une mesure au
+// collecteur. Même convention que executionKilledMaxAttempts (schedulerChannel.go).
+func metricsPushMaxAttempts() int {
+	n := 3
+	if v := os.Getenv("METRICS_PUSH_MAX_ATTEMPTS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	return n
+}
+
+// metricsPushBackoffBase lit METRICS_PUSH_RETRY_BACKOFF_BASE_MS (défaut 200) : base de l'attente exponentielle entre
+// deux tentatives (base * 2^(tentative-1)).
+func metricsPushBackoffBase() time.Duration {
+	ms := 200
+	if v := os.Getenv("METRICS_PUSH_RETRY_BACKOFF_BASE_MS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			ms = parsed
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// logSafetyMetricsUndelivered : événement [safety] critique quand une mesure n'a pu être remise au collecteur après
+// toutes les tentatives. Même forme JSON que logSafetyKilledUndelivered.
+func logSafetyMetricsUndelivered(endpoint string, entry Entry, attempts int, lastErr string) {
+	encoded, err := json.Marshal(map[string]interface{}{
+		"event":                "METRICS_PUSH_UNDELIVERED",
+		"severity":             "critical",
+		"endpoint":             endpoint,
+		"trace_id":             entry.TraceID,
+		"activation_id":        entry.ActivationID,
+		"execution_phase":      entry.ExecutionPhase,
+		"energy_attributed_uj": entry.EnergyAttributed,
+		"attempts":             attempts,
+		"last_error":           lastErr,
+		"detail": "the measurement of this activation never reached the collector: settlement, which sums the " +
+			"collector's points, will undercount this trace by energy_attributed_uj",
+	})
+	if err != nil {
+		log.Printf("[safety] METRICS_PUSH_UNDELIVERED activation=%s (marshal failed: %v)", entry.ActivationID, err)
+		return
+	}
+	log.Printf("[safety] %s", encoded)
+}
+
 // pushMetrics envoie les métriques d'une entrée vers le collecteur central.
 // L'URL du collecteur est lue depuis COLLECTOR_URL (ex: http://ow-collector:9090).
+//
+// Tentatives bornées (METRICS_PUSH_MAX_ATTEMPTS). Mesuré le 2026-09-19 (run b1bis, 384 req/min) : deux étapes gelées puis
+// reprises n'ont laissé AUCUN point — ni mesure ni cycle de pause, qui partent dans ce même POST — alors que l'étape
+// s'était terminée et avait transmis son énergie à l'étape suivante ; collecteur et InfluxDB sans erreur. Une seule
+// tentative, et son échec n'était écrit que dans la sortie d'un conteneur supprimé ensuite.
+// Renvoyer le MÊME corps est sans risque de double comptage : le collecteur date le point du `Start` de l'entrée et
+// l'étiquette par trace, activation, conteneur et phase (les cycles, par leur ThresholdDetectedAt) ; InfluxDB réécrit
+// le point de même série et même horodatage au lieu d'en ajouter un.
+// Pas de reprise sur une réponse 4xx : le collecteur refuse ce corps, le renvoyer ne changerait rien.
 func pushMetrics(endpoint string, entry Entry) {
 	collectorURL := os.Getenv("COLLECTOR_URL")
 	if collectorURL == "" {
@@ -86,25 +144,50 @@ func pushMetrics(endpoint string, entry Entry) {
 
 	url := fmt.Sprintf("%s/collect", strings.TrimRight(collectorURL, "/"))
 	client := &http.Client{Timeout: 5 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		log.Printf("pushMetrics: build request error: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
+	maxAttempts := metricsPushMaxAttempts()
+	base := metricsPushBackoffBase()
+	lastErr := "none"
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("pushMetrics: send error: %v", err)
-		return
-	}
-	defer resp.Body.Close()
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(base * time.Duration(1<<uint(attempt-1)))
+		}
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("pushMetrics: build request error: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		log.Printf("pushMetrics: unexpected status: %s", resp.Status)
-		return
-	}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err.Error()
+			log.Printf("pushMetrics: send attempt %d/%d failed activation=%s trace=%s: %v",
+				attempt+1, maxAttempts, entry.ActivationID, entry.TraceID, err)
+			continue
+		}
+		status := resp.StatusCode
+		// Drainer avant de fermer, sinon la connexion n'est pas rendue au pool (même exigence que postExecutionKilled).
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 
-	log.Printf("pushMetrics: sent %s activation=%s trace=%s energy_attr=%dµJ",
-		endpoint, entry.ActivationID, entry.TraceID, entry.EnergyAttributed)
+		if status == http.StatusOK || status == http.StatusAccepted {
+			suffix := ""
+			if attempt > 0 {
+				suffix = fmt.Sprintf(" (attempt %d/%d)", attempt+1, maxAttempts)
+			}
+			log.Printf("pushMetrics: sent %s activation=%s trace=%s energy_attr=%dµJ%s",
+				endpoint, entry.ActivationID, entry.TraceID, entry.EnergyAttributed, suffix)
+			return
+		}
+		lastErr = fmt.Sprintf("HTTP %d", status)
+		if status >= 400 && status < 500 {
+			log.Printf("pushMetrics: refused activation=%s trace=%s: HTTP %d — not retried",
+				entry.ActivationID, entry.TraceID, status)
+			break
+		}
+		log.Printf("pushMetrics: attempt %d/%d activation=%s trace=%s: HTTP %d",
+			attempt+1, maxAttempts, entry.ActivationID, entry.TraceID, status)
+	}
+	logSafetyMetricsUndelivered(endpoint, entry, maxAttempts, lastErr)
 }
