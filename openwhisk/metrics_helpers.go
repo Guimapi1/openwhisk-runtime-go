@@ -616,7 +616,14 @@ func (ap *ActionProxy) recordMetricsImpl(
 	// Corriger le WallNs de fin avec le timestamp déjà lu
 	cpuEnd.WallNs = end
 
-	detail := attributionDetail(energyStart, energyEnd, cpuStart, cpuEnd)
+	// CLAUDE.md §0 décision 44 : l'énergie d'une invocation est la somme de
+	// ses segments d'exécution, gels exclus (energySegments.go). Sans gel —
+	// et pour /init, qui n'en a jamais — c'est attributionDetail, inchangé.
+	var marks []freezeMark
+	if endpoint == "/run" {
+		marks = ap.theExecutor.FreezeMarks()
+	}
+	detail := segmentedAttribution(energyStart, energyEnd, cpuStart, cpuEnd, marks)
 	attributed := detail.AttributedUJ
 
 	// Defense-in-depth safety net (CLAUDE.md §6.9), not the primary fix:

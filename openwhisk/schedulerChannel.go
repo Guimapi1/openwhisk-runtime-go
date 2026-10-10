@@ -41,15 +41,20 @@ package openwhisk
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -110,9 +115,254 @@ func schedulerChannelTimeoutMarginMs() time.Duration {
 // ce cout comme une metrique de premier ordre — il est donc reel, pas
 // cosmetique.
 var schedulerTransport = &http.Transport{
+	// CLAUDE.md §0 décision 43 (a) : une connexion neuve vise l'adresse du
+	// scheduler résolue hors du chemin critique (voir schedulerDialContext).
+	DialContext:         schedulerDialContext,
 	MaxIdleConns:        16,
 	MaxIdleConnsPerHost: 8,
 	IdleConnTimeout:     90 * time.Second,
+}
+
+// ---------------------------------------------------------------------
+// CLAUDE.md §0 décision 43 — canal de pause : aucune résolution de nom
+// entre le gel et la décision, et cause d'échec enregistrée.
+//
+// Mesuré en campagne 8 (job 4180123) : 44 gels sur 15 162 sans commande dans
+// le délai de 2,5 s, tous sans connexion obtenue, alors que les 11 388
+// autres connexions neuves sont établies en moins de 50 ms et qu'aucun des
+// 3 730 signalements partis sur une connexion déjà ouverte n'échoue. Dans 43
+// cas, le conteneur ne rejoint le scheduler que 5,01 à 5,02 s après le gel :
+// la durée d'une tentative de résolution de nom. Le runtime s'adresse au
+// scheduler par son nom de service, qu'il résolvait à chaque connexion
+// neuve — donc aussi pendant un gel.
+//
+// (a) L'adresse est résolue au démarrage du conteneur, en arrière-plan, et
+// gardée. Une connexion neuve la vise directement. Elle n'est résolue de
+// nouveau qu'après un échec de connexion, en arrière-plan : jamais sur le
+// chemin d'un signalement de gel. Sans adresse gardée (résolution de
+// démarrage pas encore aboutie, ou adresse oubliée après un échec et pas
+// encore résolue de nouveau), la résolution se fait sur place, faute de
+// mieux ; sa durée est enregistrée.
+// (c) Chaque appel dit ce qu'il a coûté et, s'il échoue, à quelle étape :
+// résolution, connexion, délai de réponse, réponse illisible.
+// ---------------------------------------------------------------------
+
+// lookupHostFunc résout un nom en adresses. Variable : les tests y mettent
+// un résolveur lent ou en échec.
+var lookupHostFunc = func(ctx context.Context, host string) ([]string, error) {
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
+
+// positiveIntEnv reads a strictly positive integer from the environment,
+// or returns def when the variable is unset, unparsable or not positive.
+// Env read directly, per this repo's convention.
+func positiveIntEnv(name string, def int) int {
+	if v := os.Getenv(name); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return def
+}
+
+// schedulerAddressResolveMaxAttempts reads
+// SCHEDULER_ADDRESS_RESOLVE_MAX_ATTEMPTS (default 8): how many times the
+// background resolution of the scheduler address is attempted before giving
+// up. Past that, the next new connection resolves the name in place.
+func schedulerAddressResolveMaxAttempts() int {
+	return positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_MAX_ATTEMPTS", 8)
+}
+
+// schedulerAddressResolveTimeout reads SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS
+// (default 10000): bound on ONE background resolution attempt. Off the
+// critical path, so it can exceed the resolver's own 5 s per-server timeout.
+func schedulerAddressResolveTimeout() time.Duration {
+	return time.Duration(positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", 10000)) * time.Millisecond
+}
+
+// schedulerAddressResolveBackoffBase reads
+// SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_BASE_MS (default 200): base of the
+// exponential backoff between two background resolution attempts.
+func schedulerAddressResolveBackoffBase() time.Duration {
+	return time.Duration(positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_BASE_MS", 200)) * time.Millisecond
+}
+
+// schedulerAddressResolveBackoffMax reads
+// SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_MAX_MS (default 5000): cap on that
+// backoff.
+func schedulerAddressResolveBackoffMax() time.Duration {
+	return time.Duration(positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_MAX_MS", 5000)) * time.Millisecond
+}
+
+// schedulerDialer : dialer à valeurs par défaut, celui que http.Transport
+// emploie quand DialContext n'est pas renseigné (c'était le cas avant la
+// décision 43). L'ouverture d'une connexion reste bornée par le délai de la
+// requête, comme avant.
+var schedulerDialer net.Dialer
+
+// addrCache : l'adresse gardée d'un « nom:port ».
+type addrCache struct {
+	mu        sync.Mutex
+	hostport  string
+	ipport    string
+	resolving bool
+}
+
+var schedulerAddr addrCache
+
+func (c *addrCache) get(hostport string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hostport == hostport {
+		return c.ipport
+	}
+	return ""
+}
+
+func (c *addrCache) set(hostport, ipport string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hostport, c.ipport = hostport, ipport
+}
+
+func (c *addrCache) forget(hostport string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.hostport == hostport {
+		c.ipport = ""
+	}
+}
+
+// resolveAsync résout hostport en arrière-plan et garde le résultat. Sans
+// effet si une résolution est déjà en cours, ou si l'hôte est déjà une
+// adresse. Nombre de tentatives borné : au-delà, la prochaine connexion
+// résoudra sur place.
+func (c *addrCache) resolveAsync(hostport string) {
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil || net.ParseIP(host) != nil {
+		return
+	}
+	c.mu.Lock()
+	if c.resolving {
+		c.mu.Unlock()
+		return
+	}
+	c.resolving = true
+	c.mu.Unlock()
+
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			c.resolving = false
+			c.mu.Unlock()
+		}()
+		maxAttempts := schedulerAddressResolveMaxAttempts()
+		backoff, backoffMax := schedulerAddressResolveBackoffBase(), schedulerAddressResolveBackoffMax()
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), schedulerAddressResolveTimeout())
+			started := time.Now()
+			ips, lookupErr := lookupHostFunc(ctx, host)
+			cancel()
+			if ip := pickIP(ips); lookupErr == nil && ip != "" {
+				c.set(hostport, net.JoinHostPort(ip, port))
+				log.Printf("[pause] scheduler address resolved off the critical path: %s -> %s (%.1f ms, attempt %d)",
+					hostport, ip, float64(time.Since(started).Microseconds())/1000.0, attempt)
+				return
+			}
+			log.Printf("[pause] scheduler address resolution attempt %d/%d failed for %s: %v",
+				attempt, maxAttempts, hostport, lookupErr)
+			if attempt == maxAttempts {
+				break // rien à attendre après la dernière tentative
+			}
+			time.Sleep(backoff)
+			if backoff *= 2; backoff > backoffMax {
+				backoff = backoffMax
+			}
+		}
+	}()
+}
+
+// pickIP rend la première adresse IPv4, sinon la première adresse.
+func pickIP(ips []string) string {
+	for _, ip := range ips {
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() != nil {
+			return ip
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0]
+	}
+	return ""
+}
+
+// schedulerHostPort rend le « hôte:port » de SCHEDULER_URL, tel que le
+// transport le demande à schedulerDialContext.
+func schedulerHostPort() string {
+	u, err := url.Parse(schedulerURL())
+	if err != nil || u.Hostname() == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
+// warmSchedulerAddress lance la résolution de l'adresse du scheduler hors du
+// chemin critique. Appelée au démarrage du conteneur (NewActionProxy).
+func warmSchedulerAddress() {
+	if hostport := schedulerHostPort(); hostport != "" && schedulerAddr.get(hostport) == "" {
+		schedulerAddr.resolveAsync(hostport)
+	}
+}
+
+// schedulerDialContext ouvre une connexion vers le scheduler sans résolution
+// de nom quand son adresse est gardée.
+func schedulerDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	rec := connRecorderFrom(ctx)
+	dialer := &schedulerDialer
+
+	if ipport := schedulerAddr.get(addr); ipport != "" {
+		rec.noteCachedAddr()
+		rec.noteConnectStart()
+		conn, err := dialer.DialContext(ctx, network, ipport)
+		rec.noteConnectDone()
+		if err != nil {
+			// L'adresse gardée ne répond plus : on l'oublie et on la résout
+			// de nouveau en arrière-plan — jamais ici, cet appel est
+			// peut-être fait pendant un gel.
+			schedulerAddr.forget(addr)
+			schedulerAddr.resolveAsync(addr)
+		}
+		return conn, err
+	}
+
+	// Pas d'adresse gardée : résolution sur place, par le même résolveur.
+	target := addr
+	if host, port, splitErr := net.SplitHostPort(addr); splitErr == nil && net.ParseIP(host) == nil {
+		rec.noteResolveStart()
+		ips, err := lookupHostFunc(ctx, host)
+		ip := pickIP(ips)
+		if err == nil && ip == "" {
+			err = fmt.Errorf("no address for %s", host)
+		}
+		rec.noteResolveDone(err)
+		if err != nil {
+			return nil, &net.DNSError{Err: err.Error(), Name: host}
+		}
+		target = net.JoinHostPort(ip, port)
+	}
+	rec.noteConnectStart()
+	conn, err := dialer.DialContext(ctx, network, target)
+	rec.noteConnectDone()
+	if err == nil && target != addr {
+		schedulerAddr.set(addr, target)
+	}
+	return conn, err
 }
 
 // schedulerClient rend un client au timeout demande, adosse au pool
@@ -141,16 +391,137 @@ type schedulerConnTrace struct {
 	// SetupNs : debut de la requete -> connexion obtenue. Proche de zero
 	// sur une connexion recyclee, de l'ordre de plusieurs ms sinon.
 	SetupNs int64
+
+	// CLAUDE.md §0 décision 43 (c).
+	// DNSNs : durée de la résolution de nom faite PENDANT cet appel ; zéro
+	// s'il n'y en a pas eu (connexion réutilisée, ou adresse gardée).
+	DNSNs int64
+	// ConnectNs : durée d'ouverture de la connexion TCP ; zéro sur une
+	// connexion réutilisée.
+	ConnectNs int64
+	// CachedAddr : la connexion neuve visait l'adresse gardée.
+	CachedAddr bool
+	// Failure : cause de l'échec de l'appel, vide s'il a abouti.
+	// resolve | connect | timeout | unreadable_response.
+	Failure string
 }
 
-// traceRequest habille une requete d'un httptrace qui remplit dst.
-func traceRequest(req *http.Request, dst *schedulerConnTrace) *http.Request {
-	start := time.Now()
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			dst.Reused = info.Reused
-			dst.SetupNs = time.Since(start).Nanoseconds()
-		},
+// Causes d'échec du canal de pause (§0 décision 43 (c)).
+const (
+	channelFailureResolve    = "resolve"
+	channelFailureConnect    = "connect"
+	channelFailureTimeout    = "timeout"
+	channelFailureUnreadable = "unreadable_response"
+)
+
+// connRecorder remplit un schedulerConnTrace pendant un appel. Verrou et
+// clôture : depuis Go 1.23, l'ouverture d'une connexion CONTINUE en
+// arrière-plan après l'expiration de la requête qui l'a demandée ; ses
+// rappels ne doivent plus rien écrire une fois l'appel revenu.
+type connRecorder struct {
+	mu               sync.Mutex
+	closed           bool
+	start            time.Time
+	trace            schedulerConnTrace
+	resolveStartedAt time.Time // zéro : aucune résolution pendant cet appel
+	resolveEnded     bool
+	resolveOK        bool
+	connectStartedAt time.Time // zéro : aucune ouverture de connexion
+	connectEnded     bool
+	gotConn          bool
+}
+
+type connRecorderKey struct{}
+
+// connRecorderFrom rend l'enregistreur de l'appel en cours, ou nil : toutes
+// ses méthodes acceptent un récepteur nil.
+func connRecorderFrom(ctx context.Context) *connRecorder {
+	rec, _ := ctx.Value(connRecorderKey{}).(*connRecorder)
+	return rec
+}
+
+func (r *connRecorder) update(fn func()) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.closed {
+		fn()
+	}
+}
+
+func (r *connRecorder) noteCachedAddr()   { r.update(func() { r.trace.CachedAddr = true }) }
+func (r *connRecorder) noteResolveStart() { r.update(func() { r.resolveStartedAt = time.Now() }) }
+func (r *connRecorder) noteConnectStart() { r.update(func() { r.connectStartedAt = time.Now() }) }
+
+func (r *connRecorder) noteResolveDone(err error) {
+	r.update(func() {
+		r.trace.DNSNs = time.Since(r.resolveStartedAt).Nanoseconds()
+		r.resolveEnded, r.resolveOK = true, err == nil
+	})
+}
+
+func (r *connRecorder) noteConnectDone() {
+	r.update(func() {
+		r.trace.ConnectNs = time.Since(r.connectStartedAt).Nanoseconds()
+		r.connectEnded = true
+	})
+}
+
+func (r *connRecorder) noteGotConn(reused bool) {
+	r.update(func() {
+		r.gotConn = true
+		r.trace.Reused = reused
+		r.trace.SetupNs = time.Since(r.start).Nanoseconds()
+	})
+}
+
+// finish clôt l'enregistrement et rend la trace. callErr est l'erreur de
+// l'appel HTTP ; unreadable dit que la réponse est arrivée mais n'a pas pu
+// être décodée.
+func (r *connRecorder) finish(callErr error, unreadable bool) schedulerConnTrace {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	// Une résolution ou une ouverture de connexion encore en cours quand
+	// l'appel revient (délai expiré) : sa durée est le temps déjà passé.
+	if !r.resolveStartedAt.IsZero() && !r.resolveEnded {
+		r.trace.DNSNs = time.Since(r.resolveStartedAt).Nanoseconds()
+	}
+	if !r.connectStartedAt.IsZero() && !r.connectEnded {
+		r.trace.ConnectNs = time.Since(r.connectStartedAt).Nanoseconds()
+	}
+	switch {
+	case unreadable:
+		r.trace.Failure = channelFailureUnreadable
+	case callErr == nil:
+	case !r.resolveStartedAt.IsZero() && !r.resolveOK:
+		// Résolution en échec, ou encore en cours quand le délai a expiré.
+		r.trace.Failure = channelFailureResolve
+	case !r.gotConn:
+		r.trace.Failure = channelFailureConnect
+	case isTimeout(callErr):
+		// Connexion obtenue, requête partie : aucune réponse dans le délai.
+		r.trace.Failure = channelFailureTimeout
+	default:
+		// Connexion perdue pendant l'échange.
+		r.trace.Failure = channelFailureConnect
+	}
+	return r.trace
+}
+
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
+}
+
+// traceRequest habille une requete d'un enregistreur de connexion.
+func traceRequest(req *http.Request, rec *connRecorder) *http.Request {
+	rec.start = time.Now()
+	ctx := context.WithValue(req.Context(), connRecorderKey{}, rec)
+	return req.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { rec.noteGotConn(info.Reused) },
 	}))
 }
 
@@ -214,22 +585,22 @@ func newPauseID() string {
 // runtime has no way to satisfy that invariant if it cannot even reach
 // the scheduler.
 func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (*SchedulerCommand, schedulerConnTrace, error) {
-	var connTrace schedulerConnTrace
+	rec := &connRecorder{}
 
 	body, err := json.Marshal(event)
 	if err != nil {
-		return nil, connTrace, fmt.Errorf("marshal EXECUTION_PAUSED event: %w", err)
+		return nil, rec.finish(nil, false), fmt.Errorf("marshal EXECUTION_PAUSED event: %w", err)
 	}
 
 	client := schedulerClient(pausedEventTimeout(maxPauseDurationMs))
 	req, err := http.NewRequest(http.MethodPost, schedulerEventsEndpoint(), bytes.NewReader(body))
 	if err != nil {
-		return nil, connTrace, fmt.Errorf("build EXECUTION_PAUSED request: %w", err)
+		return nil, rec.finish(nil, false), fmt.Errorf("build EXECUTION_PAUSED request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(traceRequest(req, &connTrace))
+	resp, err := client.Do(traceRequest(req, rec))
 	if err != nil {
-		return nil, connTrace, fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
+		return nil, rec.finish(err, false), fmt.Errorf("POST EXECUTION_PAUSED: %w", err)
 	}
 	// Le corps doit etre DRAINE avant d'etre ferme, sinon la connexion
 	// n'est pas rendue au pool et le transport partage ne sert a rien.
@@ -257,9 +628,14 @@ func postExecutionPaused(event ExecutionPausedEvent, maxPauseDurationMs int64) (
 
 	var command SchedulerCommand
 	if err := json.NewDecoder(resp.Body).Decode(&command); err != nil {
-		return nil, connTrace, fmt.Errorf("decode scheduler command: %w", err)
+		// Délai expiré pendant la lecture du corps : c'est un délai, pas une
+		// réponse illisible.
+		if isTimeout(err) {
+			return nil, rec.finish(err, false), fmt.Errorf("read scheduler command: %w", err)
+		}
+		return nil, rec.finish(err, true), fmt.Errorf("decode scheduler command: %w", err)
 	}
-	return &command, connTrace, nil
+	return &command, rec.finish(nil, false), nil
 }
 
 // executionKilledMaxAttempts reads EXECUTION_KILLED_MAX_ATTEMPTS

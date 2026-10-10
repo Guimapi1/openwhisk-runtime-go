@@ -421,6 +421,10 @@ func (proc *Executor) monitorEnergy(
 		return
 	}
 	cpuStart := readCPUSnapshot(proc.Pid())
+	// CLAUDE.md §0 décision 44 : l'énergie de l'étape est la somme de ses
+	// segments d'exécution. Un gel clôt le segment en cours, une reprise en
+	// ouvre un nouveau ; rien n'est attribué entre les deux.
+	meter := newStepMeter(energyStart, cpuStart)
 
 	ticker := time.NewTicker(energyMonitorInterval())
 	defer ticker.Stop()
@@ -438,7 +442,7 @@ func (proc *Executor) monitorEnergy(
 				continue
 			}
 			cpuNow := readCPUSnapshot(proc.Pid())
-			stepJ := float64(attributedEnergyUJ(energyStart, energyNow, cpuStart, cpuNow)) / 1e6
+			stepJ := meter.stepJ(energyNow, cpuNow)
 			result.noteSample(time.Since(sampleStart))
 
 			if energy.ConsumedBeforeJ+stepJ < energy.ExecutionThresholdJ {
@@ -491,22 +495,19 @@ func (proc *Executor) monitorEnergy(
 
 			newThresholdJ, killed, pauseID := proc.runPauseCycle(
 				&energy, actionName, stepJ, result, thresholdDetectedAt, energyAtThresholdJ,
-				// Re-samples THIS step's attributed energy on demand,
-				// against the same baselines the loop uses — the only way
-				// runPauseCycle can measure energy at effective freeze and
-				// at effective resume without duplicating the baselines.
-				func() float64 {
-					e, err := readEnergy()
-					if err != nil {
-						return stepJ
-					}
-					return float64(attributedEnergyUJ(
-						energyStart, e, cpuStart, readCPUSnapshot(proc.Pid()),
-					)) / 1e6
-				},
+				// Le compteur par segments du moniteur : runPauseCycle le
+				// clôt au gel effectif et le rouvre à la reprise effective.
+				meter,
 			)
 			if killed {
-				result.setKilled(stepJ, pauseID)
+				// §0 décision 44 : une étape tuée après un gel est réglée à
+				// son énergie au gel effectif. Sans gel effectif (gel en
+				// échec), c'est la valeur à la détection, comme avant.
+				killedStepJ := stepJ
+				if meter.frozen {
+					killedStepJ = meter.closedJ()
+				}
+				result.setKilled(killedStepJ, pauseID)
 				return
 			}
 			energy.ExecutionThresholdJ = newThresholdJ
@@ -534,7 +535,7 @@ func (proc *Executor) monitorEnergy(
 func (proc *Executor) runPauseCycle(
 	energy *EnergyState, actionName string, stepJ float64,
 	result *energyMonitorResult, thresholdDetectedAt time.Time, energyAtThresholdJ float64,
-	sampleStepJ func() float64,
+	meter *stepMeter,
 ) (newThresholdJ float64, killed bool, pauseID string) {
 	pauseID = newPauseID()
 	// §7.9 (PHASE13A): this cycle's own record. Filled in as the cycle
@@ -592,7 +593,15 @@ func (proc *Executor) runPauseCycle(
 	// §7.9 energy_at_effective_freeze — the left-hand side of §4.4's
 	// invariant. Read AFTER the cgroup is confirmed frozen, so it counts
 	// everything the guard had to absorb between detection and freeze.
-	cycle.EnergyAtEffectiveFreezeJ = energy.ConsumedBeforeJ + sampleStepJ()
+	//
+	// §0 décision 44 : ce relevé CLÔT le segment d'exécution en cours. Tant
+	// que l'étape est gelée, son énergie ne bouge plus, quelle que soit
+	// l'activité des autres conteneurs du nœud.
+	frozenStepJ := stepJ
+	if proc.closeSegmentAtFreeze(meter, energy.TraceID, pauseID) {
+		frozenStepJ = meter.closedJ()
+	}
+	cycle.EnergyAtEffectiveFreezeJ = energy.ConsumedBeforeJ + frozenStepJ
 
 	event := ExecutionPausedEvent{
 		Event:            "EXECUTION_PAUSED",
@@ -641,11 +650,23 @@ func (proc *Executor) runPauseCycle(
 		cycle.CommandRoundtripNs = time.Since(commandSentAt).Nanoseconds()
 		cycle.ConnReused = connTrace.Reused
 		cycle.ConnSetupNs = connTrace.SetupNs
+		// CLAUDE.md §0 décision 43 (c) : ce que le canal a coûté, et la cause
+		// d'un échec — lisibles dans les données, sans le journal du conteneur.
+		cycle.ChannelTraced = true
+		cycle.ChannelDNSNs = connTrace.DNSNs
+		cycle.ChannelConnectNs = connTrace.ConnectNs
+		cycle.ChannelCachedAddr = connTrace.CachedAddr
+		if connTrace.Failure != "" {
+			cycle.ChannelFailure = connTrace.Failure
+		}
 		log.Printf(
-			"[pause] scheduler channel trace=%s pause=%s conn_reused=%v conn_setup=%.3fms roundtrip=%.3fms",
+			"[pause] scheduler channel trace=%s pause=%s conn_reused=%v conn_setup=%.3fms roundtrip=%.3fms "+
+				"dns=%.3fms connect=%.3fms cached_addr=%v failure=%q",
 			energy.TraceID, pauseID, connTrace.Reused,
 			float64(connTrace.SetupNs)/1e6,
 			float64(cycle.CommandRoundtripNs)/1e6,
+			float64(connTrace.DNSNs)/1e6, float64(connTrace.ConnectNs)/1e6,
+			connTrace.CachedAddr, connTrace.Failure,
 		)
 		if err != nil {
 			if nt, k, pid, retry := killOrRetry("PAUSE_CHANNEL_FAILED", "warning",
@@ -677,14 +698,20 @@ func (proc *Executor) runPauseCycle(
 				continue
 			}
 			resumeEffectiveAt := time.Now()
-			// §7.9 resume_requested_at / resume_effective_at, plus the
-			// energy attributed while frozen: EnergyAtResumeEffectiveJ −
-			// EnergyAtEffectiveFreezeJ should be ≈ 0 if the cgroup freeze
-			// is genuinely effective. That difference is a VERIFICATION
-			// of the freezer, not a cost — see Lifecycle's comment.
+			// §7.9 resume_requested_at / resume_effective_at.
+			//
+			// §0 décision 44 : la reprise effective OUVRE un nouveau
+			// segment. Aucune énergie n'est attribuée au gel :
+			// EnergyAtResumeEffectiveJ vaut EnergyAtEffectiveFreezeJ par
+			// construction. Le contrôle du gel porte sur le temps CPU
+			// consommé par le conteneur entre les deux relevés, qui doit
+			// être nul (CPUUsecWhileFrozen).
 			cycle.ResumeRequestedAt = float64(resumeRequestedAt.UnixNano()) / 1e9
 			cycle.ResumeEffectiveAt = float64(resumeEffectiveAt.UnixNano()) / 1e9
-			cycle.EnergyAtResumeEffectiveJ = energy.ConsumedBeforeJ + sampleStepJ()
+			if cpuUsec, ok := proc.openSegmentAtResume(meter, energy.TraceID, pauseID); ok {
+				cycle.CPUUsecWhileFrozen = &cpuUsec
+			}
+			cycle.EnergyAtResumeEffectiveJ = energy.ConsumedBeforeJ + frozenStepJ
 			cycle.Outcome = "resumed"
 			log.Printf(
 				"[resume] trace=%s pause=%s resumed, new_threshold=%.4fJ",

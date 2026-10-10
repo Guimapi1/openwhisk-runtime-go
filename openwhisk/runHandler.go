@@ -334,7 +334,11 @@ func (ap *ActionProxy) runHandler(w http.ResponseWriter, r *http.Request) {
 		if ap.theExecutor != nil {
 			stepCPUEnd = readCPUSnapshot(ap.theExecutor.Pid())
 		}
-		measuredJ := float64(attributedEnergyUJ(energyStart, stepEnergyEnd, cpuStart, stepCPUEnd)) / 1e6
+		// §0 décision 44 : par segments d'exécution, gels exclus — la même
+		// valeur que celle envoyée au collecteur par recordMetricsImpl.
+		measuredJ := float64(segmentedAttribution(
+			energyStart, stepEnergyEnd, cpuStart, stepCPUEnd, ap.theExecutor.FreezeMarks(),
+		).AttributedUJ) / 1e6
 
 		injectStart := time.Now()
 		updatedObjmap, reinjectErr := ReinjectEnergyState(objmap, energyState, measuredJ)

@@ -51,11 +51,34 @@ type PauseCycle struct {
 	ConnReused  bool  `json:"conn_reused,omitempty"`
 	ConnSetupNs int64 `json:"conn_setup_ns,omitempty"`
 
+	// CLAUDE.md §0 décision 43 (c) : le canal de pause, par cycle. Durée de
+	// la résolution de nom faite pendant le dernier appel (zéro : aucune —
+	// connexion réutilisée ou adresse gardée), durée d'ouverture de la
+	// connexion, connexion ouverte vers l'adresse gardée, et cause du
+	// dernier appel en échec de ce cycle (resolve | connect | timeout |
+	// unreadable_response ; vide si aucun appel n'a échoué).
+	//
+	// ChannelTraced : ce runtime mesure ces quatre grandeurs. Sans ce
+	// marqueur, le collecteur ne peut pas distinguer « zéro mesuré » de
+	// « non mesuré » (une image d'actions plus ancienne) ; il n'écrit alors
+	// aucun de ces champs.
+	ChannelTraced     bool   `json:"channel_traced,omitempty"`
+	ChannelDNSNs      int64  `json:"channel_dns_ns,omitempty"`
+	ChannelConnectNs  int64  `json:"channel_connect_ns,omitempty"`
+	ChannelCachedAddr bool   `json:"channel_cached_addr,omitempty"`
+	ChannelFailure    string `json:"channel_failure,omitempty"`
+
 	// §7.9 resume_requested_at / resume_effective_at. Zero when the cycle
 	// did not end in a resume (killed, or still queued).
 	ResumeRequestedAt        float64 `json:"resume_requested_at,omitempty"`
 	ResumeEffectiveAt        float64 `json:"resume_effective_at,omitempty"`
 	EnergyAtResumeEffectiveJ float64 `json:"energy_at_resume_effective_j,omitempty"`
+
+	// CLAUDE.md §0 décision 44 : temps CPU consommé par le conteneur entre
+	// le gel effectif et la reprise effective. C'est le contrôle du gel : il
+	// doit être nul. Pointeur : zéro est une mesure, et le champ est absent
+	// quand le cycle n'a pas repris ou que rien n'a pu être relevé.
+	CPUUsecWhileFrozen *int64 `json:"cpu_usec_while_frozen,omitempty"`
 
 	// resumed | killed | queued_wait. Low cardinality: the collector tags
 	// the point with it, so a campaign can filter cycles by outcome

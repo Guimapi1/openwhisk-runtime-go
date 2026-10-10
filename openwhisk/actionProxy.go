@@ -66,6 +66,9 @@ type ActionProxy struct {
 // NewActionProxy creates a new action proxy that can handle http requests
 func NewActionProxy(baseDir string, compiler string, outFile *os.File, errFile *os.File) *ActionProxy {
 	os.Mkdir(baseDir, 0755)
+	// CLAUDE.md §0 décision 43 (a) : l'adresse du scheduler est résolue ici,
+	// au démarrage du conteneur et en arrière-plan — pas pendant un gel.
+	warmSchedulerAddress()
 	return &ActionProxy{
 		false,
 		baseDir,

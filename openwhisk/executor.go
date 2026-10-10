@@ -53,6 +53,9 @@ type Executor struct {
 	output     *bufio.Reader
 	exited     chan bool
 	controller *ActivationController
+	// Marques de gel de l'invocation en cours (CLAUDE.md §0 décision 44,
+	// energySegments.go) : posées par le moniteur, lues en fin d'étape.
+	marks *freezeMarks
 }
 
 // execCounter names each activation's dedicated cgroup uniquely within
@@ -117,7 +120,17 @@ func NewExecutor(logout *os.File, logerr *os.File, command string, env map[strin
 		output,
 		make(chan bool),
 		controller,
+		&freezeMarks{},
 	}
+}
+
+// FreezeMarks rend les marques de gel de l'invocation en cours (§0 décision
+// 44). À lire une fois Interact() revenu : le moniteur est alors arrêté.
+func (proc *Executor) FreezeMarks() []freezeMark {
+	if proc == nil || proc.marks == nil {
+		return nil
+	}
+	return proc.marks.snapshot()
 }
 
 // Pid returns the PID of the underlying process, or 0 if not started.
@@ -160,6 +173,10 @@ func (proc *Executor) CgroupPath() string {
 // outlives an invocation in a warm container, so per-invocation state
 // stored there would silently leak into the next one.
 func (proc *Executor) Interact(in []byte, energy *EnergyState) ([]byte, error, *EnergyKillInfo, *Lifecycle) {
+	// Une invocation commence sans marque de gel (§0 décision 44) : celles de
+	// l'invocation précédente du même conteneur ne la concernent pas.
+	proc.marks.reset()
+
 	// input to the subprocess
 	proc.input.Write(in)
 	proc.input.Write([]byte("\n"))
