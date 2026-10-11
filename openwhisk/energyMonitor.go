@@ -603,6 +603,16 @@ func (proc *Executor) runPauseCycle(
 	}
 	cycle.EnergyAtEffectiveFreezeJ = energy.ConsumedBeforeJ + frozenStepJ
 
+	// §0 décision 44 : dernier relevé du temps CPU du conteneur TANT QU'IL
+	// EST ENCORE GELÉ, à faire juste avant de le dégeler ou de le tuer. Le
+	// compteur du noyau peut être en retard au relevé du gel effectif ; ce
+	// qu'il a compté depuis appartient au segment que le gel a clos
+	// (refineFrozenSegment). L'énergie au gel effectif du cycle est alors
+	// celle du segment complété : c'est celle qui sera réglée.
+	refineWhileFrozen := func() {
+		proc.refineCycleWhileFrozen(meter, &cycle, energy.ConsumedBeforeJ)
+	}
+
 	event := ExecutionPausedEvent{
 		Event:            "EXECUTION_PAUSED",
 		TraceID:          energy.TraceID,
@@ -632,6 +642,7 @@ func (proc *Executor) runPauseCycle(
 			return 0, false, pauseID, true // retry
 		}
 		log.Printf("[safety] %s for trace=%s pause=%s — killing (%s).", event, energy.TraceID, pauseID, detail)
+		refineWhileFrozen()
 		killRequestedAt := time.Now()
 		if killErr := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); killErr != nil {
 			log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, killErr)
@@ -689,6 +700,7 @@ func (proc *Executor) runPauseCycle(
 
 		switch command.Command {
 		case "RESUME_EXECUTION":
+			refineWhileFrozen()
 			resumeRequestedAt := time.Now()
 			if err := proc.controller.resumeExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
 				if nt, k, pid, retry := killOrRetry("RESUME_FAILED", "critical",
@@ -703,15 +715,13 @@ func (proc *Executor) runPauseCycle(
 			// §0 décision 44 : la reprise effective OUVRE un nouveau
 			// segment. Aucune énergie n'est attribuée au gel :
 			// EnergyAtResumeEffectiveJ vaut EnergyAtEffectiveFreezeJ par
-			// construction. Le contrôle du gel porte sur le temps CPU
-			// consommé par le conteneur entre les deux relevés, qui doit
-			// être nul (CPUUsecWhileFrozen).
+			// construction. Le contrôle du gel (CPUUsecWhileFrozen) est le
+			// temps CPU compté entre le relevé du gel effectif et le
+			// dernier relevé fait avant le dégel (refineWhileFrozen).
 			cycle.ResumeRequestedAt = float64(resumeRequestedAt.UnixNano()) / 1e9
 			cycle.ResumeEffectiveAt = float64(resumeEffectiveAt.UnixNano()) / 1e9
-			if cpuUsec, ok := proc.openSegmentAtResume(meter, energy.TraceID, pauseID); ok {
-				cycle.CPUUsecWhileFrozen = &cpuUsec
-			}
-			cycle.EnergyAtResumeEffectiveJ = energy.ConsumedBeforeJ + frozenStepJ
+			proc.openSegmentAtResume(meter, energy.TraceID, pauseID)
+			cycle.EnergyAtResumeEffectiveJ = cycle.EnergyAtEffectiveFreezeJ
 			cycle.Outcome = "resumed"
 			log.Printf(
 				"[resume] trace=%s pause=%s resumed, new_threshold=%.4fJ",
@@ -761,6 +771,7 @@ func (proc *Executor) runPauseCycle(
 				continue
 			}
 			log.Printf("[energy_monitor] KILL_EXECUTION received for trace=%s pause=%s reason=%s", energy.TraceID, pauseID, command.Reason)
+			refineWhileFrozen()
 			killRequestedAt := time.Now()
 			if err := proc.controller.killExecution(energy.TraceID, energy.ReservationID, pauseID); err != nil {
 				log.Printf("[energy_monitor] killExecution failed for trace=%s pause=%s: %v", energy.TraceID, pauseID, err)

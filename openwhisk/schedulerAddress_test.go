@@ -52,6 +52,9 @@ type fakeResolver struct {
 	ip    string
 	err   error
 	calls int64
+	// lostFirst : les N premiers appels ne reçoivent jamais de réponse (une
+	// requête DNS perdue) ; ils ne reviennent qu'à l'annulation de leur contexte.
+	lostFirst int64
 }
 
 func (r *fakeResolver) set(delay time.Duration, ip string, err error) {
@@ -61,7 +64,10 @@ func (r *fakeResolver) set(delay time.Duration, ip string, err error) {
 }
 
 func (r *fakeResolver) lookup(ctx context.Context, host string) ([]string, error) {
-	atomic.AddInt64(&r.calls, 1)
+	if n := atomic.AddInt64(&r.calls, 1); n <= atomic.LoadInt64(&r.lostFirst) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	r.mu.Lock()
 	delay, ip, err := r.delay, r.ip, r.err
 	r.mu.Unlock()
@@ -139,6 +145,7 @@ func TestSchedulerAddress_ResolvedAtStartup_APauseEventNeverWaitsForTheResolver(
 func TestSchedulerAddress_WarmUpDoesNotBlockTheCaller(t *testing.T) {
 	fs := newFakeSchedulerServer(t)
 	hostport, resolver := useNamedScheduler(t, fs.server.URL)
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "2000") // un résolveur lent, pas une requête perdue
 	resolver.set(400*time.Millisecond, "127.0.0.1", nil)
 
 	started := time.Now()
@@ -158,6 +165,7 @@ func TestSchedulerAddress_ColdCache_ASlowResolutionIsRecordedAsTheCause(t *testi
 	fs := newFakeSchedulerServer(t)
 	hostport, resolver := useNamedScheduler(t, fs.server.URL)
 	t.Setenv("SCHEDULER_CHANNEL_TIMEOUT_MARGIN_MS", "100")
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "2000") // un résolveur lent, pas une requête perdue
 	resolver.set(700*time.Millisecond, "127.0.0.1", nil)
 
 	started := time.Now()
@@ -205,6 +213,7 @@ func TestSchedulerAddress_CachedAddressRefused_FailsFastAndReResolvesInTheBackgr
 	deadAddr := dead.Addr().String()
 	require.NoError(t, dead.Close())
 	schedulerAddr.set(hostport, deadAddr)
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "2000") // un résolveur lent, pas une requête perdue
 	resolver.set(300*time.Millisecond, "127.0.0.1", nil)
 
 	started := time.Now()
@@ -341,6 +350,7 @@ func TestRunHandler_PauseChannelFailure_CauseReachesTheCollector(t *testing.T) {
 	require.Len(t, payloads[0].Lifecycle.Cycles, 1)
 	cycle := payloads[0].Lifecycle.Cycles[0]
 	assert.Equal(t, "killed", cycle.Outcome)
+	require.NotNil(t, cycle.CPUUsecWhileFrozen, "kill décidé par le runtime après un gel : le contrôle du gel est relevé avant le kill")
 	assert.True(t, cycle.ChannelTraced, "le runtime déclare qu'il mesure le canal : le collecteur n'écrit ces champs qu'à cette condition")
 	assert.Equal(t, channelFailureTimeout, cycle.ChannelFailure)
 	assert.True(t, cycle.ChannelCachedAddr, "connexion vers l'adresse résolue au démarrage")
@@ -366,7 +376,7 @@ func TestSchedulerAddressSettings_DefaultsOverridesAndInvalidValues(t *testing.T
 		t.Setenv(name, "")
 	}
 	assert.Equal(t, 8, schedulerAddressResolveMaxAttempts())
-	assert.Equal(t, 10*time.Second, schedulerAddressResolveTimeout())
+	assert.Equal(t, 500*time.Millisecond, schedulerAddressResolveTimeout())
 	assert.Equal(t, 200*time.Millisecond, schedulerAddressResolveBackoffBase())
 	assert.Equal(t, 5*time.Second, schedulerAddressResolveBackoffMax())
 
@@ -385,7 +395,7 @@ func TestSchedulerAddressSettings_DefaultsOverridesAndInvalidValues(t *testing.T
 		t.Setenv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_BASE_MS", invalid)
 		t.Setenv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_MAX_MS", invalid)
 		assert.Equal(t, 8, schedulerAddressResolveMaxAttempts(), "valeur %q", invalid)
-		assert.Equal(t, 10*time.Second, schedulerAddressResolveTimeout(), "valeur %q", invalid)
+		assert.Equal(t, 500*time.Millisecond, schedulerAddressResolveTimeout(), "valeur %q", invalid)
 		assert.Equal(t, 200*time.Millisecond, schedulerAddressResolveBackoffBase(), "valeur %q", invalid)
 		assert.Equal(t, 5*time.Second, schedulerAddressResolveBackoffMax(), "valeur %q", invalid)
 	}
@@ -476,4 +486,89 @@ func TestSchedulerAddress_BackgroundResolutionBackoffDoublesThenIsCapped(t *test
 		assert.True(t, gap >= 20*time.Millisecond, "attente n° %d doublée (20 ms au moins) : %s", i, gap)
 		assert.True(t, gap < 150*time.Millisecond, "attente n° %d plafonnée à 20 ms, pas 40, 80, 160… : %s", i, gap)
 	}
+}
+
+// Ce que la grappe a montré le 2026-10-11 : une résolution sur sept reste
+// bloquée 5 s pendant une montée de charge, alors qu'une seconde résolution,
+// lancée entre-temps, aboutit en quelques millisecondes. Une requête perdue ne
+// doit donc coûter qu'une tentative courte.
+
+// Au démarrage : l'adresse est gardée après une tentative courte et une attente, pas après 5 s.
+func TestSchedulerAddress_BackgroundResolution_ALostQueryCostsOneShortAttempt(t *testing.T) {
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "100")
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_BASE_MS", "10")
+	fs := newFakeSchedulerServer(t)
+	hostport, resolver := useNamedScheduler(t, fs.server.URL)
+	atomic.StoreInt64(&resolver.lostFirst, 1)
+
+	started := time.Now()
+	warmSchedulerAddress()
+	waitFor(t, 3*time.Second, "adresse gardée malgré la requête perdue", func() bool { return schedulerAddr.get(hostport) != "" })
+	elapsed := time.Since(started)
+
+	assert.Equal(t, int64(2), resolver.count(), "une tentative perdue, une tentative aboutie")
+	assert.True(t, elapsed >= 100*time.Millisecond, "la première tentative a attendu son délai : %s", elapsed)
+	assert.True(t, elapsed < time.Second, "une tentative courte, pas le délai du résolveur : %s", elapsed)
+	waitFor(t, time.Second, "résolution en arrière-plan terminée", func() bool { return !addrResolving() })
+}
+
+// Pendant un gel, sans adresse gardée : le signalement part après une tentative courte, dans son délai.
+func TestSchedulerAddress_ColdCache_ALostQueryDoesNotCostThePauseEventItsDeadline(t *testing.T) {
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "100")
+	fs := newFakeSchedulerServer(t)
+	hostport, resolver := useNamedScheduler(t, fs.server.URL)
+	atomic.StoreInt64(&resolver.lostFirst, 2) // deux requêtes perdues de suite
+
+	started := time.Now()
+	command, trace, err := postExecutionPaused(pausedEventFor("lost-query"), 2000)
+	elapsed := time.Since(started)
+
+	require.NoError(t, err)
+	assert.Equal(t, "RESUME_EXECUTION", command.Command)
+	assert.Equal(t, int64(3), resolver.count(), "deux tentatives perdues, la troisième aboutit")
+	assert.True(t, elapsed >= 200*time.Millisecond && elapsed < time.Second, "deux tentatives de 100 ms, pas 5 s : %s", elapsed)
+	assert.False(t, trace.CachedAddr)
+	assert.Equal(t, "", trace.Failure)
+	assert.True(t, trace.DNSNs >= (200*time.Millisecond).Nanoseconds(), "la durée de résolution enregistrée couvre les tentatives perdues : %d ns", trace.DNSNs)
+	assert.True(t, schedulerAddr.get(hostport) != "", "l'adresse résolue sur place est gardée")
+}
+
+// Sans adresse gardée et sans réponse du tout : le nombre de tentatives sur place est borné.
+func TestSchedulerAddress_ColdCache_InPlaceAttemptsAreBounded(t *testing.T) {
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", "20")
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_MAX_ATTEMPTS", "4")
+	fs := newFakeSchedulerServer(t)
+	_, resolver := useNamedScheduler(t, fs.server.URL)
+	atomic.StoreInt64(&resolver.lostFirst, 1000)
+
+	_, trace, err := postExecutionPaused(pausedEventFor("never"), 2000)
+
+	require.Error(t, err)
+	assert.Equal(t, channelFailureResolve, trace.Failure)
+	assert.Equal(t, int64(4), resolver.count(), "SCHEDULER_ADDRESS_RESOLVE_MAX_ATTEMPTS tentatives, pas une de plus")
+	assert.Empty(t, fs.getPausedEvents())
+}
+
+// Une réponse sans adresse n'est pas une adresse : c'est un échec de
+// résolution, au démarrage comme sur place. Sans ce contrôle, le runtime se
+// connecterait à « :port », c'est-à-dire à lui-même.
+func TestSchedulerAddress_AnAnswerWithoutAddressIsAResolutionFailure(t *testing.T) {
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_MAX_ATTEMPTS", "2")
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_BASE_MS", "1")
+	t.Setenv("SCHEDULER_ADDRESS_RESOLVE_RETRY_BACKOFF_MAX_MS", "2")
+	fs := newFakeSchedulerServer(t)
+	hostport, resolver := useNamedScheduler(t, fs.server.URL)
+	resolver.set(0, "", nil) // le résolveur répond, sans adresse
+
+	warmSchedulerAddress()
+	waitFor(t, 2*time.Second, "résolution en arrière-plan abandonnée", func() bool {
+		return resolver.count() >= 2 && !addrResolving()
+	})
+	assert.Equal(t, "", schedulerAddr.get(hostport), "aucune adresse gardée")
+
+	_, trace, err := postExecutionPaused(pausedEventFor("no-address"), 500)
+	require.Error(t, err)
+	assert.Equal(t, channelFailureResolve, trace.Failure)
+	assert.Empty(t, fs.getPausedEvents(), "aucun signalement n'est parti vers une adresse vide")
+	assert.Equal(t, "", schedulerAddr.get(hostport))
 }

@@ -174,10 +174,29 @@ func schedulerAddressResolveMaxAttempts() int {
 }
 
 // schedulerAddressResolveTimeout reads SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS
-// (default 10000): bound on ONE background resolution attempt. Off the
-// critical path, so it can exceed the resolver's own 5 s per-server timeout.
+// (default 500): bound on ONE resolution attempt (resolveOnce). Deliberately
+// far below the resolver's own 5 s wait for a lost query, so that a lost
+// query costs one short attempt and the next one goes out. Measured on the
+// cluster (2026-10-11, 357 container starts): 308 resolutions took 4.2 to
+// 15.8 ms, the 49 others stalled 5.00 to 5.01 s — 47 of them in the single
+// minute where 169 containers started.
 func schedulerAddressResolveTimeout() time.Duration {
-	return time.Duration(positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", 10000)) * time.Millisecond
+	return time.Duration(positiveIntEnv("SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS", 500)) * time.Millisecond
+}
+
+// resolveOnce : une tentative de résolution de host, bornée par
+// SCHEDULER_ADDRESS_RESOLVE_TIMEOUT_MS. Rend la première adresse utilisable.
+func resolveOnce(ctx context.Context, host string) (string, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, schedulerAddressResolveTimeout())
+	defer cancel()
+	ips, err := lookupHostFunc(attemptCtx, host)
+	if err != nil {
+		return "", err
+	}
+	if ip := pickIP(ips); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("no address for %s", host)
 }
 
 // schedulerAddressResolveBackoffBase reads
@@ -259,11 +278,9 @@ func (c *addrCache) resolveAsync(hostport string) {
 		maxAttempts := schedulerAddressResolveMaxAttempts()
 		backoff, backoffMax := schedulerAddressResolveBackoffBase(), schedulerAddressResolveBackoffMax()
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			ctx, cancel := context.WithTimeout(context.Background(), schedulerAddressResolveTimeout())
 			started := time.Now()
-			ips, lookupErr := lookupHostFunc(ctx, host)
-			cancel()
-			if ip := pickIP(ips); lookupErr == nil && ip != "" {
+			ip, lookupErr := resolveOnce(context.Background(), host)
+			if lookupErr == nil {
 				c.set(hostport, net.JoinHostPort(ip, port))
 				log.Printf("[pause] scheduler address resolved off the critical path: %s -> %s (%.1f ms, attempt %d)",
 					hostport, ip, float64(time.Since(started).Microseconds())/1000.0, attempt)
@@ -341,14 +358,19 @@ func schedulerDialContext(ctx context.Context, network, addr string) (net.Conn, 
 		return conn, err
 	}
 
-	// Pas d'adresse gardée : résolution sur place, par le même résolveur.
+	// Pas d'adresse gardée : résolution sur place, par tentatives courtes
+	// (resolveOnce) enchaînées sans attente — cet appel est peut-être fait
+	// pendant un gel, et une requête DNS perdue ne doit pas lui coûter les
+	// 5 s du résolveur.
 	target := addr
 	if host, port, splitErr := net.SplitHostPort(addr); splitErr == nil && net.ParseIP(host) == nil {
 		rec.noteResolveStart()
-		ips, err := lookupHostFunc(ctx, host)
-		ip := pickIP(ips)
-		if err == nil && ip == "" {
-			err = fmt.Errorf("no address for %s", host)
+		var ip string
+		var err error
+		for attempt, maxAttempts := 1, schedulerAddressResolveMaxAttempts(); ; attempt++ {
+			if ip, err = resolveOnce(ctx, host); err == nil || ctx.Err() != nil || attempt >= maxAttempts {
+				break
+			}
 		}
 		rec.noteResolveDone(err)
 		if err != nil {

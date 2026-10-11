@@ -162,6 +162,164 @@ func TestFreezeMarks_ResetAndResumeOnlyCompletesAnOpenFreeze(t *testing.T) {
 	assert.Empty(t, marks.snapshot())
 }
 
+// Le compteur de temps CPU était en retard au relevé du gel : ce qu'il compte
+// ensuite, pendant le gel, complète le segment clos. L'instant et l'énergie
+// du gel effectif ne changent pas, donc l'énergie suit le temps CPU.
+func TestStepMeter_RefineFrozenCPU_CompletesTheClosedSegment(t *testing.T) {
+	t.Setenv("RAPL_CORES", "0")
+	e := joules(1000)
+	meter := newStepMeter(e, snap(0, 0))
+	assert.Equal(t, int64(0), meter.refineFrozenCPU(999_999), "sans gel en cours : rien")
+
+	meter.closeAt(e+joules(100), snap(1, 0.5)) // 100 J × 0,5 s ÷ 1 s
+	assert.InDelta(t, 50.0, meter.closedJ(), 1e-9)
+
+	assert.Equal(t, int64(100_000), meter.refineFrozenCPU(600_000)) // 0,1 s compté en retard
+	assert.InDelta(t, 60.0, meter.closedJ(), 1e-9, "100 J × 0,6 s ÷ 1 s")
+	assert.Equal(t, int64(0), meter.refineFrozenCPU(600_000), "même relevé : rien de plus")
+	assert.Equal(t, int64(0), meter.refineFrozenCPU(550_000), "un relevé plus bas est ignoré")
+	assert.InDelta(t, 60.0, meter.closedJ(), 1e-9)
+	assert.InDelta(t, 60.0, meter.stepJ(e+joules(5000), snap(3, 0.6)), 1e-9, "toujours gelé : l'énergie ne bouge pas")
+
+	// Le segment suivant repart du temps CPU du gel complété : rien n'est perdu, rien n'est compté deux fois.
+	meter.openAt(e+joules(1100), snap(3, 0.6))
+	assert.InDelta(t, 60.0+50.0, meter.stepJ(e+joules(1200), snap(4, 1.1)), 1e-9)
+	assert.Equal(t, int64(0), meter.refineFrozenCPU(2_000_000), "après la reprise : rien")
+}
+
+func TestFreezeMarks_RefineOnlyRaisesTheCPUOfAnOpenFreeze(t *testing.T) {
+	var marks freezeMarks
+	marks.refineFreezeCPU(123) // aucune marque : ignoré
+	assert.Empty(t, marks.snapshot())
+
+	marks.noteFreeze(10, snap(1, 0.5))
+	marks.refineFreezeCPU(400_000) // plus bas : ignoré
+	assert.Equal(t, int64(500_000), marks.snapshot()[0].FreezeCPU.ProcessTicks)
+	marks.refineFreezeCPU(520_000)
+	got := marks.snapshot()[0]
+	assert.Equal(t, int64(520_000), got.FreezeCPU.ProcessTicks)
+	assert.Equal(t, int64(1e9), got.FreezeCPU.WallNs, "l'instant du gel effectif ne change pas")
+	assert.Equal(t, int64(10), got.FreezeEnergyUJ, "l'énergie au gel effectif ne change pas")
+
+	marks.noteResume(20, snap(2, 0.52))
+	marks.refineFreezeCPU(900_000) // déjà reprise : ignoré
+	assert.Equal(t, int64(520_000), marks.snapshot()[0].FreezeCPU.ProcessTicks)
+}
+
+// fauxConteneur : un Executor dont le cgroup et le compteur d'énergie du nœud
+// sont deux fichiers que le test écrit. Aucun processus, aucun vrai gel : on
+// y rejoue exactement ce que le noyau a montré sur grappe.
+type fauxConteneur struct {
+	t       *testing.T
+	proc    *Executor
+	cpuStat string
+	rapl    string
+}
+
+func newFauxConteneur(t *testing.T) *fauxConteneur {
+	t.Helper()
+	dir := t.TempDir()
+	f := &fauxConteneur{t: t, cpuStat: dir + "/cpu.stat", rapl: dir + "/energy_uj"}
+	t.Setenv("RAPL_PATH", f.rapl)
+	t.Setenv("RAPL_CORES", "0")
+	f.proc = &Executor{controller: &ActivationController{cg: &cgroupHandle{path: dir}}, marks: &freezeMarks{}}
+	f.set(joules(1000), 0)
+	return f
+}
+
+func (f *fauxConteneur) set(energyUJ, cpuUsec int64) {
+	f.t.Helper()
+	require.NoError(f.t, ioutil.WriteFile(f.rapl, []byte(fmt.Sprintf("%d\n", energyUJ)), 0644))
+	require.NoError(f.t, ioutil.WriteFile(f.cpuStat, []byte(fmt.Sprintf("usage_usec %d\nuser_usec 0\nsystem_usec 0\n", cpuUsec)), 0644))
+}
+
+// Ce que la grappe a montré le 2026-10-11 : le compteur de temps CPU du
+// conteneur avance encore après la confirmation du gel. Ce temps ne doit être
+// perdu ni compté deux fois, et le moniteur et la mesure finale doivent dire
+// la même chose.
+func TestFrozenSegment_CPUCountedAfterTheFreezeConfirmation_IsNeitherLostNorCountedTwice(t *testing.T) {
+	f := newFauxConteneur(t)
+	energyStart, cpuStart, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+	meter := newStepMeter(energyStart, cpuStart)
+
+	_, ok := f.proc.refineFrozenSegment(meter)
+	assert.False(t, ok, "étape non gelée : rien à compléter")
+
+	time.Sleep(20 * time.Millisecond)
+	f.set(joules(1002), 10_000) // gel effectif : 10 ms de CPU lus
+	require.True(t, f.proc.closeSegmentAtFreeze(meter, "trace", "pause"))
+	auGel := meter.closedJ()
+	require.True(t, auGel > 0)
+
+	// Pendant le gel : le nœud brûle 50 J pour d'autres, et le noyau finit
+	// de compter 400 µs que le conteneur avait consommées avant de geler.
+	f.set(joules(1052), 10_400)
+	late, ok := f.proc.refineFrozenSegment(meter)
+	require.True(t, ok)
+	assert.Equal(t, int64(400), late, "le contrôle du gel : temps CPU compté depuis le relevé du gel effectif")
+	assert.InDelta(t, auGel*1.04, meter.closedJ(), 3e-6, "même énergie du nœud, même durée, 4 %% de temps CPU en plus")
+	marks := f.proc.FreezeMarks()
+	require.Len(t, marks, 1)
+	assert.Equal(t, int64(10_400), marks[0].FreezeCPU.ProcessTicks)
+	late, ok = f.proc.refineFrozenSegment(meter)
+	assert.True(t, ok)
+	assert.Equal(t, int64(0), late, "rien de plus au second relevé")
+
+	// Dégel : quand le relevé de reprise est pris, le conteneur a déjà recalculé 50 µs.
+	f.set(joules(1052), 10_450)
+	require.True(t, f.proc.openSegmentAtResume(meter, "trace", "pause"))
+	assert.Equal(t, int64(10_400), meter.segCPU.ProcessTicks, "le segment suivant repart du temps CPU du gel")
+	marks = f.proc.FreezeMarks()
+	require.True(t, marks[0].Resumed)
+	assert.Equal(t, int64(10_400), marks[0].ResumeCPU.ProcessTicks)
+	_, ok = f.proc.refineFrozenSegment(meter)
+	assert.False(t, ok, "étape reprise : rien à compléter")
+
+	time.Sleep(20 * time.Millisecond)
+	f.set(joules(1054), 30_000) // fin de l'étape
+	energyEnd, cpuEnd, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+
+	detail := segmentedAttribution(energyStart, energyEnd, cpuStart, cpuEnd, marks)
+	assert.Equal(t, int64(30_000), detail.DeltaProcessUsec, "tout le temps CPU de l'étape, une fois et une seule")
+	assert.InDelta(t, float64(detail.AttributedUJ)/1e6, meter.stepJ(energyEnd, cpuEnd), 3e-6,
+		"le moniteur et la mesure finale attribuent la même énergie")
+	// L'énergie du nœud pendant le gel (50 J) n'est attribuée à personne : l'étape reste sous les 4 J de ses segments.
+	assert.True(t, detail.AttributedUJ < joules(4), "énergie attribuée : %d µJ", detail.AttributedUJ)
+}
+
+// Étape tuée pendant son gel : elle est réglée à l'énergie de son segment clos, temps CPU compté en retard compris.
+func TestFrozenSegment_KilledWhileFrozen_IsSettledWithTheCompletedSegment(t *testing.T) {
+	f := newFauxConteneur(t)
+	energyStart, cpuStart, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+	meter := newStepMeter(energyStart, cpuStart)
+	time.Sleep(20 * time.Millisecond)
+	f.set(joules(1002), 10_000)
+	require.True(t, f.proc.closeSegmentAtFreeze(meter, "trace", "pause"))
+	f.set(joules(1052), 10_250)
+	// Juste avant le kill, comme le fait le moniteur : le cycle de pause reçoit le contrôle du gel et
+	// l'énergie au gel effectif du segment complété.
+	cycle := PauseCycle{EnergyAtEffectiveFreezeJ: 7.0 + meter.closedJ()}
+	avant := meter.closedJ()
+	f.proc.refineCycleWhileFrozen(meter, &cycle, 7.0)
+	require.NotNil(t, cycle.CPUUsecWhileFrozen)
+	assert.Equal(t, int64(250), *cycle.CPUUsecWhileFrozen)
+	assert.True(t, meter.closedJ() > avant, "le segment clos a reçu le temps CPU compté en retard")
+	assert.InDelta(t, 7.0+meter.closedJ(), cycle.EnergyAtEffectiveFreezeJ, 1e-12,
+		"le cycle porte l'énergie du segment complété, cumul des étapes précédentes compris")
+
+	// Après le kill : le nœud continue de brûler, le cgroup ne compte plus rien.
+	f.set(joules(1100), 10_250)
+	energyEnd, cpuEnd, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+	detail := segmentedAttribution(energyStart, energyEnd, cpuStart, cpuEnd, f.proc.FreezeMarks())
+	assert.Equal(t, int64(10_250), detail.DeltaProcessUsec)
+	assert.InDelta(t, meter.closedJ(), float64(detail.AttributedUJ)/1e6, 3e-6,
+		"l'énergie réglée est celle du gel effectif, que le moniteur a envoyée dans EXECUTION_KILLED")
+}
+
 // --- De bout en bout -----------------------------------------------------
 
 // rateControlledRAPL : faux compteur d'énergie du nœud, incrémenté toutes les
@@ -316,7 +474,8 @@ func TestRunHandler_FrozenStep_IsNotChargedForNodeEnergyDuringTheFreeze(t *testi
 
 	// Aucune énergie n'est attribuée au gel.
 	assert.Equal(t, cycle.EnergyAtEffectiveFreezeJ, cycle.EnergyAtResumeEffectiveJ)
-	// Le contrôle du gel : le conteneur n'a pas consommé de temps CPU entre les deux relevés.
+	// Le contrôle du gel : temps CPU compté entre le relevé du gel effectif et le dernier relevé avant le
+	// dégel. Un conteneur gelé ne calcule pas ; il peut rester un retard de comptabilité du noyau, d'un tick au plus.
 	require.NotNil(t, cycle.CPUUsecWhileFrozen, "le temps CPU pendant le gel doit être mesuré")
 	assert.True(t, *cycle.CPUUsecWhileFrozen <= 5000,
 		"un cgroup gelé ne consomme pas de CPU : %d µs en %.3f s de gel", *cycle.CPUUsecWhileFrozen, frozenS)
@@ -384,7 +543,9 @@ func TestRunHandler_StepKilledAfterAFreeze_IsSettledAtItsEnergyAtTheEffectiveFre
 	require.Len(t, p.Lifecycle.Cycles, 1)
 	cycle := p.Lifecycle.Cycles[0]
 	require.Equal(t, "killed", cycle.Outcome)
-	assert.Nil(t, cycle.CPUUsecWhileFrozen, "pas de reprise : rien à mesurer")
+	require.NotNil(t, cycle.CPUUsecWhileFrozen, "le contrôle du gel est relevé juste avant le kill")
+	assert.True(t, *cycle.CPUUsecWhileFrozen <= 5000,
+		"un cgroup gelé ne consomme pas de CPU : %d µs comptées depuis le relevé du gel", *cycle.CPUUsecWhileFrozen)
 	frozenJ := cycle.EnergyAtEffectiveFreezeJ
 	require.True(t, frozenJ > 0.5, "énergie au gel effectif : %.3f J", frozenJ)
 
