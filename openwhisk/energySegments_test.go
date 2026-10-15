@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -318,6 +319,62 @@ func TestFrozenSegment_KilledWhileFrozen_IsSettledWithTheCompletedSegment(t *tes
 	assert.Equal(t, int64(10_250), detail.DeltaProcessUsec)
 	assert.InDelta(t, meter.closedJ(), float64(detail.AttributedUJ)/1e6, 3e-6,
 		"l'énergie réglée est celle du gel effectif, que le moniteur a envoyée dans EXECUTION_KILLED")
+}
+
+// §0 décision 46 (2026-10-15) : EXECUTION_PAUSED porte le cumul de la phase au GEL EFFECTIF (§7.5 étapes 5 et 6,
+// §5.1), pas celui de la détection du seuil. Entre les deux, le conteneur a encore calculé : le faux conteneur avance
+// l'énergie du nœud et le temps CPU entre le relevé de la détection et celui du gel.
+func TestPauseCycle_PausedEventCarriesTheCumulativeAtTheEffectiveFreeze(t *testing.T) {
+	f := newFauxConteneur(t)
+	dir := filepath.Dir(f.cpuStat)
+	events := filepath.Join(dir, "cgroup.events")
+	require.NoError(t, ioutil.WriteFile(events, []byte("populated 1\nfrozen 1\n"), 0644)) // relu par le gel
+	f.proc.controller = &ActivationController{cg: &cgroupHandle{path: dir}, state: StateRunning, waiter: &waitOnce{}}
+	fs := newFakeSchedulerServer(t)
+	fs.setCommandFunc(func(ev ExecutionPausedEvent) SchedulerCommand {
+		// relu par le dégel ; rien d'autre ne change pendant le gel
+		require.NoError(t, ioutil.WriteFile(events, []byte("populated 1\nfrozen 0\n"), 0644))
+		return SchedulerCommand{
+			Command: "RESUME_EXECUTION", TraceID: ev.TraceID, ReservationID: ev.ReservationID,
+			PauseID: ev.PauseID, NewExecutionThresholdJ: 99,
+		}
+	})
+
+	energyStart, cpuStart, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+	meter := newStepMeter(energyStart, cpuStart)
+	time.Sleep(20 * time.Millisecond)
+	f.set(joules(1002), 10_000) // détection du seuil
+	energyAt, cpuAt, err := f.proc.segmentSnapshot()
+	require.NoError(t, err)
+	stepAtDetectionJ := meter.stepJ(energyAt, cpuAt)
+	require.True(t, stepAtDetectionJ > 0)
+	time.Sleep(20 * time.Millisecond)
+	f.set(joules(1003), 15_000) // le gel effectif vient après : le conteneur a encore calculé
+
+	energy := &EnergyState{
+		TraceID: "t", ReservationID: "t", ExecutionPhase: "forward",
+		ExecutionThresholdJ: 7.0 + stepAtDetectionJ, ConsumedBeforeJ: 7.0,
+		PauseEnabled: true, PauseMode: "CGROUP_FREEZE", MaxPauseDurationMs: 2000, MaxPauseCount: 1,
+		InterruptionClass: map[string]string{"action": "KILL_SAFE"},
+	}
+	result := &energyMonitorResult{}
+	newThresholdJ, killed, _ := f.proc.runPauseCycle(
+		energy, "action", stepAtDetectionJ, result, time.Now(), 7.0+stepAtDetectionJ, meter)
+	require.False(t, killed)
+	assert.Equal(t, 99.0, newThresholdJ)
+
+	paused := fs.getPausedEvents()
+	require.Len(t, paused, 1)
+	require.Len(t, result.lifecycle.Cycles, 1)
+	cycle := result.lifecycle.Cycles[0]
+	assert.InDelta(t, 7.0+meter.closedJ(), paused[0].EnergyConsumedJ, 1e-12,
+		"le signalement porte le cumul au gel effectif : cumul des étapes précédentes et segment clos au gel")
+	assert.Equal(t, cycle.EnergyAtEffectiveFreezeJ, paused[0].EnergyConsumedJ)
+	assert.Equal(t, 7.0+stepAtDetectionJ, cycle.EnergyAtThresholdJ)
+	assert.True(t, paused[0].EnergyConsumedJ-cycle.EnergyAtThresholdJ > 1e-6,
+		"et non le cumul à la détection : %.9f J au gel, %.9f J à la détection",
+		paused[0].EnergyConsumedJ, cycle.EnergyAtThresholdJ)
 }
 
 // --- De bout en bout -----------------------------------------------------

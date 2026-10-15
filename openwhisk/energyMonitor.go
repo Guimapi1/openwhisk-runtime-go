@@ -620,7 +620,12 @@ func (proc *Executor) runPauseCycle(
 		PauseID:          pauseID,
 		ActionName:       actionName,
 		ExecutionPhase:   energy.ExecutionPhase,
-		EnergyConsumedJ:  energy.ConsumedBeforeJ + stepJ,
+		// §7.5 (étapes 5 et 6), §5.1, §0 décision 46 : le cumul de la phase au GEL EFFECTIF, relevé après la
+		// confirmation du gel. C'est la part que le scheduler impute au créneau d'origine quand ce gel contient la
+		// frontière, et la consommation contre laquelle il juge la marge utile d'une extension partielle (§4.2).
+		// Jusqu'au 2026-10-15, l'événement portait le cumul à la DÉTECTION du seuil (energy.ConsumedBeforeJ +
+		// stepJ) : sur les 118 cycles du 2026-10-12, gel effectif moins détection de -0,6 à +7,9 mJ.
+		EnergyConsumedJ:  cycle.EnergyAtEffectiveFreezeJ,
 		PauseRequestedAt: float64(requestedAt.UnixNano()) / 1e9,
 		PauseEffectiveAt: float64(effectiveAt.UnixNano()) / 1e9,
 		FreezeLatencyMs:  freezeLatencyMs,
